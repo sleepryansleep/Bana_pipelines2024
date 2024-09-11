@@ -1,0 +1,153 @@
+#!/bin/bash
+
+#SBATCH --partition=super                                # select partion from 128GB, 256GB, 384GB, GPU and super
+#SBATCH --nodes=1                                        # number of nodes requested by user
+#SBATCH --time=0-240:00:00                               # run time, format: D-H:M:S (max wallclock time)
+#SBATCH --output=serialJob.%j.out                        # standard output file name
+#SBATCH --error=serialJob.%j.time                        # standard error output file name
+#SBATCH --mail-user=ryan.ohara@utsouthwestern.edu        # specify an email address
+#SBATCH --mail-type=FAIL,END                             # send email when job status change (start, end, abortion and etc.)
+
+script_name="/project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/rna-seq/featureCounts.job"
+
+#Help function
+usage() {
+  echo "-h  --Help documentation for $script_name"
+  echo "-o  --Full path to output directory."
+  echo "-e  --Type of sequencing; choices are { single, paired (default) }."
+  echo "-g  --Genome to use; choices are { mouse, human }."
+  echo "-a  --Alignment type { genomic, RNA (default) } ."
+  echo "-b  --Bedfile to use for genomic alignment, usually a bedfile of merged and filtered peaks, madatory if -a genomic."
+  echo "-l  --List file of space-separated samples and grouping, see EXAMPLE_DESEQ2_GROUPS.list ."
+  echo "-p  --Prefix for output files, default is to use the name of the listfile."
+  echo "Example: sbatch $script_name -o /my/wonderful/output/dir/ -s counts -g mouse -a genomic -b WT_and_KO_merged_peaks.bed -l EXAMPLE_DESEQ2_GROUPS.list"
+  if [ -f $serialJob.$SLURM_JOB_ID.out ]; then
+    mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.featureCounts.out
+  fi
+  if [ -f $serialJob.$SLURM_JOB_ID.out ]; then
+    mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.featureCounts.err
+  fi
+  exit 1
+}
+
+main(){
+  OPTIND=1 # Reset OPTIND
+  while getopts :o:e:g:a:b:l:p:h opt
+      do
+          case $opt in
+              o) dir=$OPTARG;;
+              e) type=$OPTARG;;
+              g) genome=$OPTARG;;
+              a) alignment=$OPTARG;;
+              b) peaksfile=$OPTARG;;
+              l) listfile=$OPTARG;;
+              p) prefix=$OPTARG;;
+              h) usage;;
+          esac
+      done
+  shift $(($OPTIND -1))
+
+  #Check for mandatory options.
+  if [[ -z $dir ]] || [[ -z $genome ]] || [[ -z $alignment ]] || [[ -z $type ]] || [[ -z $prefix ]] || [[ -z $listfile ]] || [[ -z $peaksfile ]]; then
+      echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ inputs did not pass to featureCounts.job correctly"
+      echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ inputs did not pass to featureCounts.job correctly" > $dir/$genome/DESeq2/$prefix\_featureCounts.txt
+      usage
+  fi
+
+  #Set genome files.
+  if [[ "$genome" == "mouse" ]] || [[ "$genome" == "mm" ]] || [[ "$genome" == "mm10" ]]; then
+    genome=mouse
+    fasta=/project/GCRB/shared/Star_Indexes_2.7.2b/mm10/mm10_and_repeat_families/genome_files/mm10_genome.fa
+    annotation=/project/GCRB/shared/Star_Indexes_2.7.2b/mm10/mm10_and_ercc_and_gfp/genome_files/mm10.refGene_and_ERCC_and_markers.gtf
+  elif [[ "$genome" == "human" ]] || [[ "$genome" == "hg38" ]]; then
+    genome=human
+    fasta=/project/GCRB/shared/Star_Indexes_2.7.2b/hg38/genome_files/hg38_genome.fa
+    annotation=/project/GCRB/shared/Star_Indexes_2.7.2b/hg38/genome_files/hg38.refGene_and_ERCC_and_markers.gtf
+  else
+    echo "BAKA! \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $genome is not a genome option"
+    mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$step.$prefix.out
+    mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$step.$prefix.err
+    exit 1
+  fi
+
+  #Set CPUs to use.
+  cputhread=$(expr $SLURM_CPUS_ON_NODE - 3)
+  if [[ "$cputhread" -gt "64" ]]; then
+    cputhread=61
+  fi
+  echo "using" $cputhread "CPUs of node"
+  echo "JOB ID: $SLURM_JOB_ID"
+
+  bams=$(cut -f 1 -d " " $listfile | awk '{printf "%s",$1" "}' | cut -f 1)
+
+  #Create peaks.saf
+  if [[ "$alignment" == "genomic" ]]; then
+    module load bedtools
+
+    fn=$(basename "${peaksfile}")
+    peaksname=${fn%.*}
+
+    grep -w \
+    'chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chrX\|chrY' \
+    $peaksfile \
+    | bedtools merge -i - \
+    > $dir/$genome/DESeq2/$peaksname.bed
+
+    if [ ! -f $dir/$genome/DESeq2/$peaksname.bed ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ filtering peaks bedfile"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.err
+        exit 1
+    fi
+
+    awk 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print "Peak"NR"_"$1":"$2"-"$3,$1,$2,$3,"."}' \
+    $dir/$genome/DESeq2/$peaksname.bed \
+    > $dir/$genome/DESeq2/$peaksname.saf
+
+    if [ ! -f $dir/$genome/DESeq2/$peaksname.saf ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ creating peaks saf file"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.err
+        exit 1
+    fi
+  fi
+
+  #Create featureCounts file
+  module load subread/1.6.3
+  if [[ "$alignment" == "RNA" ]]; then
+    if [[ "$type" == "paired" ]]; then
+      featureCounts -p -T $cputhread -t exon -g gene_id \
+      -O --fraction -M --primary \
+      -G $fasta -a $annotation \
+      -o $dir/$genome/DESeq2/$prefix\_featureCounts.txt \
+      $bams
+    elif [[ "$type" == "single" ]]; then
+      featureCounts -T $cputhread -t exon -g gene_id \
+      -O --fraction -M --primary \
+      -G $fasta -a $annotation \
+      -o $dir/$genome/DESeq2/$prefix\_featureCounts.txt \
+      $bams
+    fi
+  elif [[ "$alignment" == "genomic" ]]; then
+    if [[ "$type" == "paired" ]]; then
+      featureCounts -p -T $cputhread -F SAF \
+      -O --fraction -M \
+      -G $fasta -a $dir/$genome/DESeq2/$peaksname.saf \
+      -o $dir/$genome/DESeq2/$prefix\_featureCounts.txt \
+      $bams
+    elif [[ "$type" == "single" ]]; then
+      featureCounts -T $cputhread -F SAF \
+      -O --fraction -M \
+      -G $fasta -a $dir/$genome/DESeq2/$peaksname.saf \
+      -o $dir/$genome/DESeq2/$prefix\_featureCounts.txt \
+      $bams
+    fi
+  fi
+  module unload subread/1.6.3
+
+  mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.out
+  mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.DESeq2.$prefix.err
+
+}
+
+main "$@"
