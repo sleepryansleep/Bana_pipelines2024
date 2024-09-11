@@ -1,0 +1,202 @@
+#!/bin/bash
+
+#SBATCH --partition=super                                # select partion from 128GB, 256GB, 384GB, GPU and super
+#SBATCH --nodes=1                                        # number of nodes requested by user
+#SBATCH --time=0-240:00:00                               # run time, format: D-H:M:S (max wallclock time)
+#SBATCH --output=serialJob.%j.out                        # standard output file name
+#SBATCH --error=serialJob.%j.time                        # standard error output file name
+#SBATCH --mail-user=ryan.ohaha@utsouthwestern.edu        # specify an email address
+#SBATCH --mail-type=FAIL,END                             # send email when job status change (start, end, abortion and etc.)
+
+dir=/project/GCRB/Banaszynski_lab/shared/Ryan/MeCP2_Zoghbi_collab/CnR
+genome=mouse
+type=paired
+bamslist=$dir/job_files/2024.03_new/bams.list
+repeatlist=$dir/job_files/2024.03_new/repeats.list
+
+cputhread=$(expr $SLURM_CPUS_ON_NODE - 3)
+echo "using" $cputhread "CPUs of node"
+
+if [[ "$genome" == "mouse" ]] || [[ "$genome" == "mm" ]] || [[ "$genome" == "mm10" ]]; then
+  genome=mouse
+  fasta=/project/GCRB/shared/Star_Indexes_2.7.2b/mm10/mm10_and_repeat_families/genome_files/mm10_genome.fa
+  chromlength=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/mm10.chromlength
+  blacklist=/project/GCRB/Banaszynski_lab/shared/Ryan/previous_publications/GSE66390_mouse_preimplantation/ATAC/mouse/beds/mm10_blacklist.bed
+  repdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/individual_family_beds/cleaned
+  replist=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/dfam_mm10_repeats.list
+  safdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/saf
+elif [[ "$genome" == "human" ]] || [[ "$genome" == "hg38" ]]; then
+  genome=human
+  fasta=/project/GCRB/shared/Star_Indexes_2.7.2b/hg38/genome_files/hg38_genome.fa
+  chromlength=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/hg38.chromlength
+  blacklist=/project/GCRB/shared/Star_Indexes_2.7.2b/hg38/genome_files/hg38_blacklisted.bed
+  repdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/individual_family_beds/cleaned
+  replist=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/dfam_hg38_repeats.list
+  safdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/saf
+fi
+
+bams=$(cut -f 1 -d " " $bamslist | awk -v d="$dir" -v g="$genome" '{printf "%s",d"/"g"/ecoli_norm/bam/"$1".NoDup.downsampled.bam "}' | cut -f 1)
+mkdir $dir/$genome/featureCounts
+
+module load bedtools
+while IFS=" " read -r repeat
+do
+
+  cat /project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/individual_family_beds/$repeat.bed \
+  | grep -w 'chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chr23\|chrX\|chrY' \
+  | sort -k1,1 -k2,2n \
+  | bedtools merge -i - \
+  | awk -v r="$repeat" 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print r"_"$1":"$2"-"$3,$1,$2,$3,"."}' - \
+  > $dir/mouse/MACS2_out/repeat_bed_intersections/All_$repeat.saf
+
+  cat $dir/mouse/MACS2_out/CnR_H3K9me3_*week_merged_peaks.broadPeak \
+  | bedtools intersect -u -a /project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/individual_family_beds/$repeat.bed \
+  -b - \
+  | grep -w 'chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chr23\|chrX\|chrY' \
+  | sort -k1,1 -k2,2n \
+  | bedtools merge -i - \
+  > $dir/mouse/MACS2_out/repeat_bed_intersections/Heterchromatin_$repeat.bed
+
+  awk -v r="$repeat" 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print r"_"$1":"$2"-"$3,$1,$2,$3,"."}' \
+  $dir/mouse/MACS2_out/repeat_bed_intersections/Heterchromatin_$repeat.bed \
+  > $dir/mouse/MACS2_out/repeat_bed_intersections/Heterchromatin_$repeat.saf
+
+  cat $dir/mouse/MACS2_out/CnR_H3K27ac_*week_merged_peaks.narrowPeak \
+  | bedtools intersect -u -a /project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/individual_family_beds/$repeat.bed \
+  -b - \
+  | grep -w 'chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chr23\|chrX\|chrY' \
+  | sort -k1,1 -k2,2n \
+  | bedtools merge -i - \
+  > $dir/mouse/MACS2_out/repeat_bed_intersections/Euchromatin_$repeat.bed
+
+  awk -v r="$repeat" 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print r"_"$1":"$2"-"$3,$1,$2,$3,"."}' \
+  $dir/mouse/MACS2_out/repeat_bed_intersections/Euchromatin_$repeat.bed \
+  > $dir/mouse/MACS2_out/repeat_bed_intersections/Euchromatin_$repeat.saf
+
+  module load subread/1.6.3
+
+  featureCounts -p -T $cputhread -F SAF \
+  -O --fraction -M \
+  -G $fasta -a $dir/mouse/MACS2_out/repeat_bed_intersections/All_$repeat.saf \
+  -o $dir/$genome/featureCounts/All_$repeat\_featureCounts.txt \
+  $bams
+
+  featureCounts -p -T $cputhread -F SAF \
+  -O --fraction -M \
+  -G $fasta -a $dir/mouse/MACS2_out/repeat_bed_intersections/Heterchromatin_$repeat.saf \
+  -o $dir/$genome/featureCounts/Heterochromatin_$repeat\_featureCounts.txt \
+  $bams
+
+  featureCounts -p -T $cputhread -F SAF \
+  -O --fraction -M \
+  -G $fasta -a $dir/mouse/MACS2_out/repeat_bed_intersections/Euchromatin_$repeat.saf \
+  -o $dir/$genome/featureCounts/Euchromatin_$repeat\_featureCounts.txt \
+  $bams
+
+  module unload subread/1.6.3
+
+done < $repeatlist
+
+for region in \
+  All \
+  Heterochromatin \
+  Euchromatin
+do
+  echo echo \
+  | awk 'BEGIN{OFS="\t"}{print "FAMILY","W1_MeCP2","W2_MeCP2","W4_MeCP2","W8_MeCP2","W1_H3K9me3","W2_H3K9me3","W4_H3K9me3","W8_H3K9me3","W1_H3K27ac","W2_H3K27ac","W4_H3K27ac","W8_H3K27ac"}' \
+  > $dir/$region\_featureCounts_log2FC.tab
+
+  while IFS=" " read -r repeat
+  do
+
+    m1w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 7,8 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    m2w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 9,10 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    m4w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 11,12 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    m8w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 13,14 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k91w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 15,16 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k92w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 17,18 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k94w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 19,20 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k98w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 21,22 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k271w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 23,24 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k272w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 25,26 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k274w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 27,28 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    k278w=$(tail -n +3 $dir/$genome/featureCounts/$region\_$repeat\_featureCounts.txt \
+    | cut -f 29,30 \
+    | awk 'BEGIN{OFS="\t"}{ if ($1 > 0.01 && $2 > 0.01) {print $2/$1} }' \
+    | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+    | awk '{print log($1)/log(2)}' - )
+
+    echo echo \
+    | awk -v r="$repeat" \
+    -v a="$m1w" \
+    -v b="$m2w" \
+    -v c="$m4w" \
+    -v d="$m8w" \
+    -v e="$k91w" \
+    -v f="$k92w" \
+    -v g="$k94w" \
+    -v h="$k98w" \
+    -v i="$k271w" \
+    -v j="$k272w" \
+    -v k="$k274w" \
+    -v l="$k278w" \
+    'BEGIN{OFS="\t"}{print r,a,b,c,d,e,f,g,h,i,j,k,l}' \
+    >> $dir/$region\_featureCounts_log2FC.tab
+
+  done < $repeatlist
+done
