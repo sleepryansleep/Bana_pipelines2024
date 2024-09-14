@@ -5,7 +5,7 @@
 #SBATCH --time=0-240:00:00                               # run time, format: D-H:M:S (max wallclock time)
 #SBATCH --output=serialJob.%j.out                        # standard output file name
 #SBATCH --error=serialJob.%j.time                        # standard error output file name
-#SBATCH --mail-user=ryan.ohara@utsouthwestern.edu        # specify an email address
+#SBATCH --mail-user=thecodedeity@utsouthwestern.edu      # specify an email address
 #SBATCH --mail-type=FAIL,END                             # send email when job status change (start, end, abortion and etc.)
 
 script_name="/project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/master_pipe_individual_v2.0.job"
@@ -659,13 +659,13 @@ main(){
         if [[ "$type" == "paired" ]]; then
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
-          --keep-dup 1 --call-summits --nomodel -f BAMPE -g $genome_size \
+          --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
         elif [[ "$type" == "single" ]]; then
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
-          --keep-dup 1 --call-summits --nomodel --extsize 146 -g $genome_size \
+          --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
         fi
@@ -690,14 +690,14 @@ main(){
         if [[ "$type" == "paired" ]]; then
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
-          --keep-dup 1 --broad --nomodel -f BAMPE -g $genome_size \
+          --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
           --max-gap 2000 --min-length 450 \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
         elif [[ "$type" == "single" ]]; then
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
-          --keep-dup 1 --broad --nomodel --extsize 146 -g $genome_size \
+          --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
           --max-gap 2000 --min-length 450 \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
@@ -747,14 +747,14 @@ main(){
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
           -c $input \
-          --keep-dup 1 --call-summits --nomodel -f BAMPE -g $genome_size \
+          --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
         elif [[ "$type" == "single" ]]; then
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
           -c $input \
-          --keep-dup 1 --call-summits --nomodel --extsize 146 -g $genome_size \
+          --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
         fi
@@ -780,7 +780,7 @@ main(){
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
           -c $input \
-          --keep-dup 1 --broad --nomodel -f BAMPE -g $genome_size \
+          --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
           --max-gap 2000 --min-length 450 \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
@@ -788,7 +788,7 @@ main(){
 
           macs2 callpeak -t $dir/$genome/bam/$sample.bam \
           -c $input \
-          --keep-dup 1 --broad --nomodel --extsize 146 -g $genome_size \
+          --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
           --max-gap 2000 --min-length 450 \
           -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
 
@@ -1206,19 +1206,36 @@ main(){
 
         module load macs/2.1.2
         if [[ "$peak" == "narrow" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel -f BAMPE -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel --extsize 146 -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
           fi
 
           if [ ! -f $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
@@ -1237,22 +1254,42 @@ main(){
           module unload bedtools
 
         elif [[ "$peak" == "broad" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel -f BAMPE -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel --extsize 146 -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
           fi
+
 
           if [ ! -f $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
               echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
@@ -1514,19 +1551,36 @@ main(){
 
         module load macs/2.1.2
         if [[ "$peak" == "narrow" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel -f BAMPE -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel --extsize 146 -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
           fi
 
           if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
@@ -1545,21 +1599,40 @@ main(){
           module unload bedtools
 
         elif [[ "$peak" == "broad" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel -f BAMPE -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel --extsize 146 -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
           fi
 
           if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
@@ -1973,19 +2046,36 @@ main(){
 
         module load macs/2.1.2
         if [[ "$peak" == "narrow" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel -f BAMPE -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --call-summits --nomodel --extsize 146 -g $genome_size \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
           fi
 
           if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
@@ -2004,21 +2094,40 @@ main(){
           module unload bedtools
 
         elif [[ "$peak" == "broad" ]]; then
-
-          if [[ "$type" == "paired" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel -f BAMPE -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
-          elif [[ "$type" == "single" ]]; then
-
-            macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
-            --keep-dup 1 --broad --nomodel --extsize 146 -g $genome_size \
-            --max-gap 2000 --min-length 450 \
-            -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
-
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
           fi
 
           if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
