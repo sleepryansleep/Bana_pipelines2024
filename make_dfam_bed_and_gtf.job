@@ -1,0 +1,61 @@
+#!/bin/bash
+
+script_name="make_dfam_bed_and_gtf.job"
+
+#Help function
+usage() {
+  echo "-h Help documentation for $script_name"
+  echo "-a  --Full path of dfam annotation file."
+  echo "-o  --Full path to output directory."
+  echo "Example: $script_name -a mm10_dfam.nrph.hits.gz -o /optional/path/to/different/output/dir/ "
+  exit 1
+}
+
+main(){
+  OPTIND=1 # Reset OPTIND
+  while getopts :a:o:h opt
+      do
+          case $opt in
+              a) annotationfile=$OPTARG;;
+              o) outdir=$OPTARG;;
+              h) usage;;
+          esac
+      done
+  shift $(($OPTIND -1))
+
+  #Check for mandatory options.
+  if [[ -z $annotationfile ]]; then
+    usage
+  fi
+  #Check then make output directory.
+  if [ -z $outdir ]; then
+      outdir=$(dirname "${annotationfile}")
+  fi
+
+  if [ ! -d $outdir ]; then
+      mkdir $outdir
+  fi
+
+  #Define the output file name, based on the annotation file
+  fn=$(basename "${annotationfile}")
+  output_fn=${fn%.*}
+
+  echo "Output directory set to: $outdir"
+  echo "Output filename set to: $output_fn"
+
+  #convert to Bed File
+  zcat $annotationfile \
+  | awk 'BEGIN{OFS="\t"}{ print $1,$10,$11,$3,$5,$9,$15 }' \
+  | awk 'BEGIN{OFS="\t"}{ if ($2 > $3) print $1,$3,$2,$4,$5,$6,$7 }{ if ($3 > $2) print $0 }' \
+  | sort -k1,1 -k2,2n \
+  > $outdir/$output_fn.bed
+
+  #convert to GTF File
+  sort -k4,4 $outdir/$output_fn.bed \
+  | awk -v a="$output_fn" \
+  'BEGIN{OFS="\t"}{ print $1,a,"transcript",$2,$3,"0",$6,".","gene_id \""$4"\"; transcript_id \""$4"_"$1"_"$2"_"$3"\";" }' \
+  > $outdir/$output_fn.gtf
+
+}
+
+main "$@"
