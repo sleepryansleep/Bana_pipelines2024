@@ -1,0 +1,329 @@
+#!/bin/bash
+
+#SBATCH --partition=super                                # select partion from 128GB, 256GB, 384GB, GPU and super
+#SBATCH --nodes=1                                        # number of nodes requested by user
+#SBATCH --time=0-240:00:00                               # run time, format: D-H:M:S (max wallclock time)
+#SBATCH --output=serialJob.%j.out                        # standard output file name
+#SBATCH --error=serialJob.%j.time                        # standard error output file name
+#SBATCH --mail-user=rya.ohaha@utsouthwestern.edu        # specify an email address
+#SBATCH --mail-type=FAIL,END                             # send email when job status change (start, end, abortion and etc.)
+
+script_name="/project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/Excel-style_repetitive_element_heatmaps.job"
+
+#Help function
+usage() {
+  echo "-h  --Help documentation for $script_name"
+  echo "-o  --Full path to output directory."
+  echo "-s  --Step to begin pipeline at; choices are { counts (default), enrichment }."
+  echo "-e  --Type of sequencing; choices are { single, paired (default) }."
+  echo "-b  --Full path to sample bam file."
+  echo "-i  --Full path to input bam file. (default no input)"
+  echo "-g  --Genome to use; choices are { mouse, human }."
+  echo "-r  --Full path to repeat list file (default is all repeats)."
+  echo "Example: sbatch $script_name -o /path/to/output/dir/ -s counts -g mouse -b /some/place/MyBeautifulChIP_rep1.bam -i /some/other/place/MyLovelyInput.bam "
+  mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+  mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+  exit 1
+}
+
+main(){
+  OPTIND=1 # Reset OPTIND
+  while getopts :o:s:e:b:i:g:r:h opt
+      do
+          case $opt in
+              o) dir=$OPTARG;;
+              s) step=$OPTARG;;
+              e) type=$OPTARG;;
+              b) bam=$OPTARG;;
+              i) input=$OPTARG;;
+              g) genome=$OPTARG;;
+              r) repeatlist=$OPTARG;;
+              h) usage;;
+          esac
+      done
+  shift $(($OPTIND -1))
+
+  #Check then make output directory.
+  if [ ! -d $dir ]; then
+      mkdir $dir
+  fi
+
+  #Check for default options.
+  if [[ -z $step ]]; then
+    step=counts
+  fi
+
+  if [[ "$step" == "counts" ]] || [[ "$step" == "enrichment" ]]; then
+    echo "start pipe at step $step"
+  else
+    echo "BAKA! (╯°□°)╯﻿ $step is not an option"
+    usage
+  fi
+
+  if [[ -z $type ]]; then
+    type=paired
+  fi
+
+  if [[ "$type" == "unpaired" ]]; then
+    type=single
+  fi
+
+  #Check bam status
+
+  if [ ! -f $bam ]; then
+      echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $bam does not exist!"
+      mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+      mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+      exit 1
+  fi
+
+  fn=$(basename "${bam}")
+  bamname=${fn%.*}
+
+  #Check for mandatory options.
+  if [[ "$step" == "counts" ]]; then
+    if [[ -z $dir ]] || [[ -z $genome ]] || [[ -z $bam ]]; then
+      usage
+    fi
+  elif [[ "$step" == "enrichment" ]]; then
+    if [[ -z $dir ]] || [[ -z $genome ]]; then
+      usage
+    fi
+  fi
+
+  #Check bam and input status
+  if [[ -z $input ]]; then
+    input=false
+  else
+    if [ ! -f $input ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+        mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+        mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+        exit 1
+    fi
+  fi
+
+  #State parameters.
+  echo "analysis of $type $genome data"
+  echo "bam file: $bam"
+  echo "output directory set to $dir"
+  cputhread=$(expr $SLURM_CPUS_ON_NODE - 3)
+  if [[ "$cputhread" -gt "64" ]]; then
+    cputhread=61
+  fi
+  echo "using" $cputhread "CPUs of node"
+  echo "JOB ID: $SLURM_JOB_ID"
+
+  #Sleepy
+  sleep $(shuf -i 1-30 -n 1)
+
+  if [[ "$genome" == "mouse" ]] || [[ "$genome" == "mm10" ]]; then
+    genome=mouse
+    index=/project/GCRB/shared/bowtie2_indexes/mm10/bowtie2_index/mm10_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10.fa
+    genome_size=2730871774
+    chromlength=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10_custom_blacklist.bed
+    repdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/individual_family_beds
+    if [[ -z $repeatlist ]]; then
+      repeatlist=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/mm10/dfam_mm10_repeats.list
+    else
+      if [ ! -f $repeatlist ]; then
+          echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $repeatlist does not exist!"
+          mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+          mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+          exit 1
+      fi
+    fi
+    echo "Repetitve Element List set to $repeatlist O=('-'Q) "
+  elif [[ "$genome" == "human" ]] || [[ "$genome" == "hg38" ]]; then
+    genome=human
+    index=/project/GCRB/shared/Star_Indexes_2.7.2b/hg38/bowtie2_index/hg38_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38.fa
+    genome_size=3209286105
+    chromlength=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38_blacklisted.bed
+    repdir=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/individual_family_beds
+    if [[ -z $repeatlist ]]; then
+      repeatlist=/project/GCRB/Banaszynski_lab/shared/repetitive_element_files/dfam/hg38/dfam_hg38_repeats.list
+    else
+      if [ ! -f $repeatlist ]; then
+          echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $repeatlist does not exist!"
+          mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+          mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+          exit 1
+      fi
+    fi
+    echo "Repetitve Element List set to $repeatlist O=('-'Q) "
+  else
+    echo "$genome is not an option"
+    usage
+  fi
+
+  if [[ "$step" == "counts" ]]; then
+    #Find read depth of bam and input
+    module load samtools
+    Breadcount=$(samtools view -c -F 260 $bam)
+
+    if [[ "$input" == "false" ]]; then
+      Ireadcount=false
+    else
+      Ireadcount=$(samtools view -c -F 260 $input)
+    fi
+    module unload samtools
+
+    if [ ! -d $dir/$genome ]; then
+        mkdir $dir/$genome
+    fi
+
+    if [ ! -d $dir/$genome/featureCounts ]; then
+        mkdir $dir/$genome/featureCounts
+    fi
+
+    if [ ! -d $dir/$genome/featureCounts/temp ]; then
+        mkdir $dir/$genome/featureCounts/temp
+    fi
+
+    if [ ! -d $dir/$genome/featureCounts/temp/counts ]; then
+        mkdir $dir/$genome/featureCounts/counts
+    fi
+
+    #Make depth file
+    echo echo | awk -v b="$Breadcount" -v i="$Ireadcount" 'BEGIN{OFS="\t"} { print b,i}' - \
+    > $dir/$genome/featureCounts/temp/$bamname.depth
+
+    #Perform featureCounts for each subfamily
+    while IFS=" " read -r repeat
+    do
+
+      if [ ! -f $dir/$genome/featureCounts/temp/$repeat.saf ]; then
+        awk -v r="$repeat" 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print r"_"$1":"$2"-"$3,$1,$2,$3,"."}' \
+        $repdir/$repeat.bed \
+        > $dir/$genome/featureCounts/temp/$repeat.saf
+      fi
+
+      module load subread/1.6.3
+      if [[ "$input" == "false" ]]; then
+        if [[ "$type" == "paired" ]]; then
+
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/featureCounts/temp/$repeat.saf \
+          -o $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+          $bam
+
+        elif [[ "$type" == "single" ]]; then
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/featureCounts/temp/$repeat.saf \
+          -o $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+          $bam
+        fi
+      else
+        if [[ "$type" == "paired" ]]; then
+
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/featureCounts/temp/$repeat.saf \
+          -o $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+          $bam $input
+
+        elif [[ "$type" == "single" ]]; then
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/featureCounts/temp/$repeat.saf \
+          -o $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+          $bam $input
+        fi
+      fi
+      module unload subread/1.6.3
+
+    done < $repeatlist
+
+    if [ ! -f $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt ]; then
+      echo "error creating $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt (っ◕ _______ ◕)っ "
+    fi
+
+  fi
+
+  if [[ "$step" == "counts" ]] || [[ "$step" == "enrichment" ]]; then
+
+    #Find read depth of bam and input
+    module load samtools
+    Breadcount=$(cut -f 1 $dir/$genome/featureCounts/temp/$bamname.depth | head -n 1)
+
+    if [[ "$input" == "false" ]]; then
+      Ireadcount=false
+    else
+      Ireadcount=$(cut -f 2 $dir/$genome/featureCounts/temp/$bamname.depth | head -n 1)
+    fi
+
+    #Create Enrichment and log2FC file
+    echo echo \
+    | awk 'BEGIN{OFS="\t"}{print "FAMILY","Enrichment(median)"}' \
+    > $dir/$genome/featureCounts/$bamname\_featureCounts_Enrichment.tab
+
+    echo echo \
+    | awk 'BEGIN{OFS="\t"}{print "FAMILY","log2FC(median)"}' \
+    > $dir/$genome/featureCounts/$bamname\_featureCounts_log2Enrichment.tab
+
+    #If no input, perform log2FC of the median using FPKM/RPKM, if input then perform log2FC using enrichment over input.
+    if [[ "$input" == "false" ]]; then
+      while IFS=" " read -r repeat
+      do
+        #Enrichment
+        fpkmEnrichment=$(tail -n +3 $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+        | cut -f 6,7 \
+        | awk -v b="$Breadcount" 'BEGIN{OFS="\t"}{ if ($2 > 1) {print ($2*10^9)/($1*b) } }' \
+        | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+        | awk '{print $1}' - )
+
+        echo echo \
+        | awk -v r="$repeat" -v e="$fpkmEnrichment" 'BEGIN{OFS="\t"}{print r,e}' \
+        >> $dir/$genome/featureCounts/$bamname\_featureCounts_Enrichment.tab
+
+        #Log2Enrichment
+        fpkmFC=$(tail -n +3 $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+        | cut -f 6,7 \
+        | awk -v b="$Breadcount" 'BEGIN{OFS="\t"}{ if ($2 > 1) {print ($2*10^9)/($1*b) } }' \
+        | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+        | awk '{print log($1)/log(2)}' - )
+
+        echo echo \
+        | awk -v r="$repeat" -v f="$fpkmFC" 'BEGIN{OFS="\t"}{print r,f}' \
+        >> $dir/$genome/featureCounts/$bamname\_featureCounts_log2Enrichment.tab
+      done < $repeatlist
+    else
+      while IFS=" " read -r repeat
+      do
+        #Enrichment
+        Enrichment=$(tail -n +3 $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+        | cut -f 7,8 \
+        | awk -v b="$Breadcount" -v i="$Ireadcount" 'BEGIN{OFS="\t"}{ if ($2 > 1) {print ($1/b)/($2/i) } }' \
+        | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+        | awk '{print $1}' - )
+
+        echo echo \
+        | awk -v r="$repeat" -v e="$Enrichment" 'BEGIN{OFS="\t"}{print r,e}' \
+        >> $dir/$genome/featureCounts/$bamname\_featureCounts_Enrichment.tab
+
+        #Log2Enrichment
+        FC=$(tail -n +3 $dir/$genome/featureCounts/counts/$bamname\_$repeat\_featureCounts.txt \
+        | cut -f 7,8 \
+        | awk -v b="$Breadcount" -v i="$Ireadcount" 'BEGIN{OFS="\t"}{ if ($2 > 1) {print ($1/b)/($2/i) } }' \
+        | /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/percentile.awk - 0.5 \
+        | awk '{print log($1)/log(2)}' - )
+
+        echo echo \
+        | awk -v r="$repeat" -v f="$FC" 'BEGIN{OFS="\t"}{print r,f}' \
+        >> $dir/$genome/featureCounts/$bamname\_featureCounts_log2Enrichment.tab
+      done < $repeatlist
+    fi
+  fi
+
+  mv $dir/outfiles/serialJob.$SLURM_JOB_ID.out $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.out
+  mv $dir/outfiles/serialJob.$SLURM_JOB_ID.time $dir/outfiles/serialJob.$SLURM_JOB_ID.repeatheatmaps$step.err
+
+}
+
+main "$@"
