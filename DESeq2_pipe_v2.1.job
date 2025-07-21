@@ -1,0 +1,2363 @@
+#!/bin/bash
+
+#SBATCH --partition=super                                # select partion from 128GB, 256GB, 384GB, GPU and super
+#SBATCH --nodes=1                                        # number of nodes requested by user
+#SBATCH --time=0-240:00:00                               # run time, format: D-H:M:S (max wallclock time)
+#SBATCH --output=serialJob.%j.out                        # standard output file name
+#SBATCH --error=serialJob.%j.time                        # standard error output file name
+
+script_name="/project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/master_pipe_individual_v2.1.job"
+
+#Help function
+usage() {
+  echo "-h  --Help documentation for $script_name"
+  echo "-o  --Full path to output directory."
+  echo "-s  --Step to begin pipeline at; choices are { srr, trim (default), align, downsample, callpeaks, frip, bigwigs, merge, tobias }."
+  echo "-e  --Type of sequencing; choices are { single, paired (default) }."
+  echo "-g  --Genome to use; choices are { mouse, BL6_T2T, CAST_T2T, human, human_T2T, bovine, rat, rabbit }."
+  echo "-i  --The name of the sample."
+  echo "-x  --The srr number of the sample. (optional)"
+  echo "-p  --Whether to call narrow or broad peaks; choices are { narrow (default), broad }."
+  echo "-v  --Spike-in genome {ecoli, drosophila, null (default) } ."
+  echo "-l  --List file of space-separated samples and input for peak calling { null (default), see EXAMPLE_SAMPLE_INPUT.list } ."
+  echo "-k  --List file of samples to group for downsampling { null (default) } ."
+  echo "-m  --List file of full/path/to/replicates.bam for merging, null (default), see EXAMPLE_SAMPLE_MERGE.list, note: your merged file will be named after this list } ."
+  echo "-d  --Allow PCR duplicates? { no (default), allow }"
+  echo "Example: sbatch $script_name -o /path/to/output/dir/ -s align -g mouse -i MyBeautifulChIP_rep1 -p broad -v drosophila"
+  mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.out
+  mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.err
+  exit 1
+}
+
+main(){
+  OPTIND=1 # Reset OPTIND
+  while getopts :o:s:e:g:i:x:p:v:l:k:m:d:h opt
+      do
+          case $opt in
+              o) dir=$OPTARG;;
+              s) step=$OPTARG;;
+              e) type=$OPTARG;;
+              g) genome=$OPTARG;;
+              i) sample=$OPTARG;;
+              x) srr=$OPTARG;;
+              p) peak=$OPTARG;;
+              v) spikein=$OPTARG;;
+              l) listfile=$OPTARG;;
+              k) downsamplelistfile=$OPTARG;;
+              m) mergefile=$OPTARG;;
+              d) duplicates=$OPTARG;;
+              h) usage;;
+          esac
+      done
+  shift $(($OPTIND -1))
+
+  #Check then make output directory.
+  if [ ! -d $dir ]; then
+      mkdir $dir
+  fi
+
+  if [ ! -d $dir/out_files ]; then
+      mkdir $dir/out_files
+  fi
+
+  #Check for mandatory options.
+  if [[ "$step" == "downsample" ]]; then
+    if [[ -z $dir ]] || [[ -z $genome ]] || [[ -z $spikein ]]; then
+      usage
+    fi
+  else
+    if [[ -z $dir ]] || [[ -z $genome ]] || [[ -z $sample ]]; then
+      usage
+    fi
+  fi
+
+  if [[ -z $duplicates ]]; then
+    duplicates=remove
+  fi
+  echo "Duplicate removal set to $duplicates"
+
+  #Check for default options.
+  if [[ -z $step ]]; then
+    step=trim
+  fi
+
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]] || [[ "$step" == "callpeaks" ]] || [[ "$step" == "frip" ]] || [[ "$step" == "bigwigs" ]] || [[ "$step" == "downsample" ]] || [[ "$step" == "spikein" ]] || [[ "$step" == "merge" ]] || [[ "$step" == "tobias" ]]; then
+    echo "start pipe at step $step"
+  else
+    echo "BAKA! (╯°□°)╯﻿ $step is not an option"
+    usage
+  fi
+
+  if [[ -z $spikein ]]; then
+    echo "no spike-in set"
+  elif [[ "$spikein" == "ecoli" ]] || [[ "$spikein" == "drosophila" ]]; then
+    echo "spike-in set to $spikein"
+  else
+    echo "BAKA! (╯°□°)╯﻿ $spikein is not an option"
+    usage
+  fi
+
+  if [[ -z $type ]]; then
+    type=paired
+  fi
+
+  if [[ "$type" == "unpaired" ]]; then
+    type=single
+  fi
+
+  if [[ -z $peak ]]; then
+    peak=narrow
+  fi
+
+  #Check Input status
+  if [[ -z $listfile ]]; then
+    input=false
+  else
+    echo "input list set to $listfile"
+    if [ ! -f $listfile ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ the input listfile $listfile does not exist"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+    if [[ "$sample" == *"input"* ]] || [[ "$sample" == *"Input"* ]] || [[ "$sample" == *"INPUT"* ]]; then
+      input=input
+    else
+      inputname=$(grep -w $sample $listfile | cut -f 2 -d " ")
+      inputdir=$(dirname "${inputname}")
+      if [[ "$inputdir" == "." ]]; then
+        input="$dir/$genome/bam/$inputname.bam"
+        echo "input for sample $sample set to $input, will wait for input"
+      elif [[ "$inputdir" == "$dir/$genome/bam" ]]; then
+        input=$inputname
+        echo "input for sample $sample set to $input, will wait for input"
+      else
+        input=$inputname
+        if [ ! -f $input ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        echo "input for sample $sample set to $input"
+      fi
+    fi
+  fi
+  if [[ "$sample" == *"input"* ]] || [[ "$sample" == *"Input"* ]] || [[ "$sample" == *"INPUT"* ]]; then
+    input=input
+  fi
+
+  #Check Mergefile status
+  if [[ "$step" == "merge" ]]; then
+    if [[ -z $mergefile ]]; then
+      mergelist=false
+    else
+      echo "merge list set to $mergefile"
+      if [ ! -f $mergefile ]; then
+          echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ the merge listfile $listfile does not exist"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+      fi
+    fi
+  fi
+
+  #State parameters.
+  echo "analysis of $type $genome data"
+  echo "sample name: $sample"
+  echo "output directory set to $dir"
+  cputhread=$(expr $SLURM_CPUS_ON_NODE - 3)
+  if [[ "$cputhread" -gt "64" ]]; then
+    cputhread=61
+  fi
+  echo "using" $cputhread "CPUs of node"
+  echo "JOB ID: $SLURM_JOB_ID"
+
+  #Sleepy
+  sleep $(shuf -i 60-180 -n 1)
+
+  if [[ "$genome" == "mouse" ]] || [[ "$genome" == "mm10" ]]; then
+    genome=mouse
+    index=/project/GCRB/shared/bowtie2_indexes/mm10/bowtie2_index/mm10_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10.fa
+    genome_size=2730871774
+    chromlength=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/mm10/genome_files/mm10_custom_blacklist.bed
+  elif [[ "$genome" == "C57BL_6J_T2T_v1" ]] || [[ "$genome" == "BL6_T2T" ]]; then
+    echo "Note: the BL6_T2T chrX actually comes from CAST_EiJ_T2T_v1"
+    genome=C57BL_6J_T2T_v1
+    index=/project/GCRB/shared/bowtie2_indexes/C57BL_6J_T2T_v1/bowtie2_index/C57BL_6J_T2T_v1_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/C57BL_6J_T2T_v1/genome_files/C57BL_6J_T2T_v1.fa
+    genome_size=2731306900
+    chromlength=/project/GCRB/shared/bowtie2_indexes/C57BL_6J_T2T_v1/genome_files/C57BL_6J_T2T_v1.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/C57BL_6J_T2T_v1/genome_files/C57BL_6J_T2T_v1_blacklistBLANK.bed
+  elif [[ "$genome" == "CAST_EiJ_T2T_v1" ]] || [[ "$genome" == "CAST_T2T" ]]; then
+    genome=CAST_EiJ_T2T_v1
+    index=/project/GCRB/shared/bowtie2_indexes/CAST_EiJ_T2T_v1/bowtie2_index/CAST_EiJ_T2T_v1_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/CAST_EiJ_T2T_v1/genome_files/CAST_EiJ_T2T_v1.fa
+    genome_size=2950550120
+    chromlength=/project/GCRB/shared/bowtie2_indexes/CAST_EiJ_T2T_v1/genome_files/CAST_EiJ_T2T_v1.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/CAST_EiJ_T2T_v1/genome_files/CAST_EiJ_T2T_v1_blacklistBLANK.bed
+  elif [[ "$genome" == "human" ]] || [[ "$genome" == "hg38" ]]; then
+    genome=human
+    index=/project/GCRB/shared/bowtie2_indexes/hg38/bowtie2_index/hg38_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38.fa
+    genome_size=3209286105
+    chromlength=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/hg38/genome_files/hg38_blacklisted.bed
+  elif [[ "$genome" == "human_T2T" ]] || [[ "$genome" == "hs1" ]] || [[ "$genome" == "hs1_T2T" ]]; then
+    genome=T2T_hs1
+    index=/project/GCRB/shared/bowtie2_indexes/hs1/bowtie2_index/hs1_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/hs1/genome_files/hs1.fa
+    genome_size=3117292070
+    chromlength=/project/GCRB/shared/bowtie2_indexes/hs1/genome_files/hs1.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/hs1/genome_files/hs1_blacklistBLANK.bed
+  elif [[ "$genome" == "bovine" ]] || [[ "$genome" == "bosTau9" ]] || [[ "$genome" == "bostau" ]]; then
+    genome=bovine
+    index=/project/GCRB/shared/bowtie2_indexes/bosTau9/bowtie2_index/bosTau9_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/bosTau9/genome_files/bosTau9.fa
+    genome_size=2715853792
+    chromlength=/project/GCRB/shared/bowtie2_indexes/bosTau9/genome_files/bosTau9.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/bosTau9/genome_files/bosTau9_blacklistBLANK.bed
+  elif [[ "$genome" == "rabbit" ]] || [[ "$genome" == "oryCun2" ]]; then
+    genome=rabbit
+    index=/project/GCRB/shared/bowtie2_indexes/oryCun2/bowtie2_index/oryCun2_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/oryCun2/genome_files/oryCun2.fa
+    genome_size=2737490501
+    chromlength=/project/GCRB/shared/bowtie2_indexes/oryCun2/genome_files/oryCun2.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/oryCun2/genome_files/oryCun2_blacklistBLANK.bed
+  elif [[ "$genome" == "rat" ]] || [[ "$genome" == "rn7" ]]; then
+    genome=rat
+    index=/project/GCRB/shared/bowtie2_indexes/rn7/bowtie2_index/rn7_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/rn7/genome_files/rn7.fa
+    genome_size=2647915728
+    chromlength=/project/GCRB/shared/bowtie2_indexes/rn7/genome_files/rn7.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/rn7/genome_files/rn7_blacklistBLANK.bed
+  elif [[ "$genome" == "dm6" ]] || [[ "$genome" == "drosophila" ]] || [[ "$genome" == "dm6_spike-in" ]] || [[ "$genome" == "drosophila_spikein" ]]; then
+    genome=drosophila_spikein
+    index=/project/GCRB/shared/bowtie2_indexes/dm6/bowtie2_index/dm6_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6.fa
+    genome_size=143726002
+    chromlength=/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6-blacklist.v2.bed
+  elif [[ "$genome" == "ecoli" ]] || [[ "$genome" == "e.coli" ]] || [[ "$genome" == "ecoli_spikein" ]] || [[ "$genome" == "e.coli_spikein" ]]; then
+    genome=ecoli_spikein
+    index=/project/GCRB/shared/bowtie2_indexes/E.coli/bowtie2_index/E.coli_bowtie2_index
+    fasta=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli.fa
+    genome_size=4641652
+    chromlength=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli.chrom.length
+    blacklist=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli_blacklistBLANK.bed
+  else
+    echo "$genome is not an option"
+    usage
+  fi
+
+  if [[ "$spikein" == "drosophila" ]]; then
+    spikein=drosophila_spikein
+    spikein_index=/project/GCRB/shared/bowtie2_indexes/dm6/bowtie2_index/dm6_bowtie2_index
+    spikein_fasta=/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6.fa
+    spikein_size=143726002
+    spikein_chromlength==/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6.chrom.length
+    spikein_blacklist=/project/GCRB/shared/bowtie2_indexes/dm6/genome_files/dm6-blacklist.v2.bed
+  elif [[ "$spikein" == "ecoli" ]]; then
+    spikein=ecoli_spikein
+    spikein_index=/project/GCRB/shared/bowtie2_indexes/E.coli/bowtie2_index/E.coli_bowtie2_index
+    spikein_fasta=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli.fa
+    spikein_size=4707961
+    spikein_chromlength=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli.chrom.length
+    spikein_blacklist=/project/GCRB/shared/bowtie2_indexes/E.coli/genome_files/E.coli_blacklistBLANK.bed
+  fi
+
+  #SRR download
+  if [[ "$step" == "srr" ]]; then
+
+    echo "beginning srr download"
+    if [ ! -d $dir/trimmed_fastq ]; then
+        mkdir $dir/trimmed_fastq
+    fi
+
+    module load sra_toolkit
+    #DOWNLOADING FASTQ FROM GEO; https://edwards.sdsu.edu/research/fastq-dump/
+    if [[ "$type" == "paired" ]]; then
+
+      fastq-dump --outdir $dir/trimmed_fastq/ --gzip --readids --read-filter pass --dumpbase --split-3 --clip $srr
+      mv $dir/trimmed_fastq/$srr\_pass_1.fastq.gz $dir/trimmed_fastq/$sample\_1.fastq.gz
+      mv $dir/trimmed_fastq/$srr\_pass_2.fastq.gz $dir/trimmed_fastq/$sample\_2.fastq.gz
+      module unload sra_toolkit
+
+      #Check step success.
+      if [ ! -f $dir/trimmed_fastq/$sample\_1.fastq.gz ] || [ ! -f $dir/trimmed_fastq/$sample\_2.fastq.gz ]; then
+          echo "error during srr \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ double check paired or single"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+      fi
+
+    elif [[ "$type" == "single" ]]; then
+      module load sra_toolkit
+      fastq-dump --outdir $dir/trimmed_fastq/ --gzip --readids --read-filter pass --dumpbase --split-3 --clip $srr
+      mv $dir/trimmed_fastq/$srr\_pass.fastq.gz $dir/trimmed_fastq/$sample.fastq.gz
+      module unload sra_toolkit
+
+      #Check step success.
+      if [ ! -f $dir/trimmed_fastq/$sample.fastq.gz ]; then
+          echo "error during srr \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ double check paired or single"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+      fi
+
+    fi
+  fi
+
+  #Fastq processing
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]]; then
+
+    echo "trim ↜(╰ •ω•)╯ ✂ trim trim trim"
+    if [ ! -d $dir/trimmed_fastq ]; then
+        mkdir $dir/trimmed_fastq
+    fi
+
+    if [[ "$type" == "paired" ]]; then
+      module load cutadapt
+      module load fastqc
+      module load trimgalore
+      #ADAPTER REMOVAL AND QUALITY ANALYSIS; USAGE: trim_galore [options] <filename(s)>
+      trim_galore --trim1 --paired --fastqc -o $dir/trimmed_fastq/ $dir/trimmed_fastq/$sample\_1.fastq.gz $dir/trimmed_fastq/$sample\_2.fastq.gz
+      rm $dir/trimmed_fastq/$sample\_1.fastq.gz
+      rm $dir/trimmed_fastq/$sample\_2.fastq.gz
+      module unload cutadapt
+      module unload fastqc
+      module unload trimgalore
+
+      #Check step success.
+      if [ ! -f $dir/trimmed_fastq/$sample\_1_val_1.fq.gz ] || [ ! -f $dir/trimmed_fastq/$sample\_2_val_2.fq.gz ]; then
+          echo "error during trimming \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+      fi
+
+    elif [[ "$type" == "single" ]]; then
+      module load cutadapt
+      module load fastqc
+      module load trimgalore
+      trim_galore --fastqc -o $dir/trimmed_fastq/ $dir/trimmed_fastq/$sample.fastq.gz
+      rm $dir/trimmed_fastq/$sample.fastq.gz
+      module unload cutadapt
+      module unload fastqc
+      module unload trimgalore
+
+      #Check step success.
+      if [ ! -f $dir/trimmed_fastq/$sample\_trimmed.fq.gz ]; then
+          echo "error during trimming \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+      fi
+
+    fi
+  fi
+
+  #Genome alignment
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]]; then
+
+    echo "beginning bowtie2 alignment to $genome ♪└(￣◇￣)┐♪"
+    if [ ! -d $dir/$genome ]; then
+        mkdir $dir/$genome
+    fi
+    if [ ! -d $dir/$genome/bam ]; then
+        mkdir $dir/$genome/bam
+    fi
+
+    module load bowtie2
+    #ALIGNMENT TO GENOME; http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml
+    if [[ "$type" == "paired" ]]; then
+
+      bowtie2 -q -R 3 -N 1 -L 20 -i S,1,0.50 \
+      --end-to-end --dovetail --no-mixed -X 2000 \
+      -p $cputhread $index \
+      -1 $dir/trimmed_fastq/$sample\_1_val_1.fq.gz \
+      -2 $dir/trimmed_fastq/$sample\_2_val_2.fq.gz \
+      -S $dir/$genome/bam/$sample.sam
+
+    elif [[ "$type" == "single" ]]; then
+
+      bowtie2 -q -R 3 -N 1 --local -i S,1,0.50 -p $cputhread $index \
+      -U $dir/trimmed_fastq/$sample\_trimmed.fq.gz \
+      -S $dir/$genome/bam/$sample.sam
+
+    fi
+    module unload bowtie2
+
+    #Check step success.
+    if [ ! -f $dir/$genome/bam/$sample.sam ]; then
+        echo "error during $genome alignment \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+
+    #CONVERT SAM TO BAM, INDEX AND SORT; http://www.htslib.org/doc/samtools.html
+    module load samtools
+    module load picard/2.10.3
+
+    samtools view -bT $fasta $dir/$genome/bam/$sample.sam > $dir/$genome/bam/$sample.temp
+
+    if [ ! -f $dir/$genome/bam/$sample.temp ]; then
+        echo "error during bam conversion \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+
+    rm $dir/$genome/bam/$sample.sam
+    samtools sort $dir/$genome/bam/$sample.temp -o $dir/$genome/bam/$sample.sorted.bam
+    rm $dir/$genome/bam/$sample.temp
+    samtools index $dir/$genome/bam/$sample.sorted.bam $dir/$genome/bam/$sample.sorted.bai
+
+    mtreads=$(samtools idxstats $dir/$genome/bam/$sample.sorted.bam | grep chrM | cut -f 3)
+    otherreads=$(samtools idxstats $dir/$genome/bam/$sample.sorted.bam \
+    | grep -v -w 'chrM\|chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chr23\|chrX\|chrY' \
+    | cut -f 3 \
+    | awk 'BEGIN{OFS="\t"}{ sum += $1 } END { if (NR > 0) print sum }')
+    unreads=$(samtools view -c -f 4 $dir/$genome/bam/$sample.sorted.bam)
+    totreads=$(samtools view -c $dir/$genome/bam/$sample.sorted.bam)
+
+    #remove mtDNA reads
+    samtools idxstats $dir/$genome/bam/$sample.sorted.bam \
+    | cut -f 1 \
+    | grep -v 'chrM' \
+    | xargs samtools view -F 4 -b $dir/$genome/bam/$sample.sorted.bam \
+    > $dir/$genome/bam/$sample.noMT.bam
+
+    if [ ! -f $dir/$genome/bam/$sample.noMT.bam ]; then
+        echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ remove mtDNA and unmapped reads"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+
+    samtools sort $dir/$genome/bam/$sample.noMT.bam -o $dir/$genome/bam/$sample.noMT.sorted.bam
+    samtools index $dir/$genome/bam/$sample.noMT.sorted.bam $dir/$genome/bam/$sample.noMT.bai
+    rm $dir/$genome/bam/$sample.sorted.bam
+    rm $dir/$genome/bam/$sample.sorted.bai
+    rm $dir/$genome/bam/$sample.noMT.bam
+    rm $dir/$genome/bam/$sample.noMT.bai
+
+    if [[ "$duplicates" == "allow" ]]; then
+      #REMOVE DUPLICATES; https://gatk.broadinstitute.org/hc/en-us/articles/360037052812-MarkDuplicates-Picard-
+      java -jar $PICARDJAR MarkDuplicates \
+        REMOVE_SEQUENCING_DUPLICATES=true \
+        I=$dir/$genome/bam/$sample.noMT.sorted.bam \
+        O=$dir/$genome/bam/$sample.NoDup.bam \
+        M=$dir/$genome/bam/$sample\_dup_metrics.txt
+    else
+      java -jar $PICARDJAR MarkDuplicates \
+        REMOVE_DUPLICATES=true \
+        I=$dir/$genome/bam/$sample.noMT.sorted.bam \
+        O=$dir/$genome/bam/$sample.NoDup.bam \
+        M=$dir/$genome/bam/$sample\_dup_metrics.txt
+    fi
+
+    if [ ! -f $dir/$genome/bam/$sample.NoDup.bam ]; then
+        echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ remove duplicates"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+
+    samtools sort $dir/$genome/bam/$sample.NoDup.bam -o $dir/$genome/bam/$sample.bam
+    samtools index $dir/$genome/bam/$sample.bam $dir/$genome/bam/$sample.bai
+
+    if [ ! -f $dir/$genome/bam/$sample.bam ]; then
+        echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ NoDup.bam sorting"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+
+    rm $dir/$genome/bam/$sample.noMT.sorted.bam
+    rm $dir/$genome/bam/$sample.NoDup.bam
+
+    dupreads=$(grep -w Unknown $dir/$genome/bam/$sample\_dup_metrics.txt | cut -f 7)
+
+    readcount=$(samtools view -c $dir/$genome/bam/$sample.bam)
+
+    if [ ! -f $dir/$genome/bam/output_stats.txt ]; then
+      echo echo | awk 'BEGIN{OFS="\t"}{ print "sample","total_reads","mtDNA","partial_assemblies","unaligned","duplicate","final_reads" }' - \
+      > $dir/$genome/bam/output_stats.txt
+    fi
+
+    #Check and remove previous readcounts.
+    if [ -f $dir/$genome\_readcounts.txt ]; then
+        sed -i "/\b$sample\b/d" $dir/$genome\_readcounts.txt
+    fi
+    if [ -f $dir/$genome/bam/output_stats.txt ]; then
+        sed -i "/\b$sample\b/d" $dir/$genome/bam/output_stats.txt
+    fi
+
+    echo echo | awk -v s="$sample" -v t="$totreads" -v m="$mtreads" -v o="$otherreads" -v u="$unreads" -v d="$dupreads" -v r="$readcount" \
+    'BEGIN{OFS="\t"}{ print s,t,m,o,u,d,r }' - \
+    >> $dir/$genome/bam/output_stats.txt
+
+    echo echo | awk -v r="$readcount" -v g="$genome" -v s="$sample" 'BEGIN{OFS="\t"}{ print s,r,g }' - \
+    >> $dir/$genome\_readcounts.txt
+
+    if [ ! -f $dir/$genome/bam/$sample.bam ]; then
+        echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+    module unload picard
+    module unload samtools
+
+  fi
+
+  #Spike-in alignment
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]] || [[ "$step" == "spikein" ]]; then
+    if [[ "$spikein" == "ecoli_spikein" ]] || [[ "$spikein" == "drosophila_spikein" ]]; then
+      if [[ "$input" == "input" ]]; then
+        echo "$sample is an Input 乁(°ω°  )ㄏ skipping spike-in alignment"
+      else
+        echo "beginning bowtie2 alignment to $spikein ヾ(⌐■_■)ノ♪ "
+        if [ ! -d $dir/$spikein ]; then
+            mkdir $dir/$spikein
+        fi
+        if [ ! -d $dir/$spikein/bam ]; then
+            mkdir $dir/$spikein/bam
+        fi
+
+        module load bowtie2
+        #ALIGNMENT TO GENOME; http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml
+        if [[ "$type" == "paired" ]]; then
+
+          bowtie2 -q -R 3 -N 1 -L 20 -i S,1,0.50 \
+          --end-to-end --dovetail --no-mixed -X 2000 \
+          -p $cputhread $spikein_index \
+          -1 $dir/trimmed_fastq/$sample\_1_val_1.fq.gz \
+          -2 $dir/trimmed_fastq/$sample\_2_val_2.fq.gz \
+          -S $dir/$spikein/bam/$sample.sam
+
+        elif [[ "$type" == "single" ]]; then
+
+          bowtie2 -q -R 3 -N 1 --local -i S,1,0.50 -p $cputhread $spikein_index \
+          -U $dir/trimmed_fastq/$sample\_trimmed.fq.gz \
+          -S $dir/$spikein/bam/$sample.sam
+
+        fi
+        module unload bowtie2
+
+        #Check step success.
+        if [ ! -f $dir/$spikein/bam/$sample.sam ]; then
+            echo "error during $spikein alignment \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        #CONVERT SAM TO BAM, INDEX AND SORT; http://www.htslib.org/doc/samtools.html
+        module load samtools
+        module load picard/2.10.3
+
+        samtools view -bT $fasta $dir/$spikein/bam/$sample.sam > $dir/$spikein/bam/$sample.temp
+
+        if [ ! -f $dir/$spikein/bam/$sample.temp ]; then
+            echo "error during $spikein bam conversion \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        rm $dir/$spikein/bam/$sample.sam
+        samtools sort $dir/$spikein/bam/$sample.temp -o $dir/$spikein/bam/$sample.sorted.bam
+        rm $dir/$spikein/bam/$sample.temp
+        samtools index $dir/$spikein/bam/$sample.sorted.bam $dir/$spikein/bam/$sample.sorted.bai
+
+        mtreads=$(samtools idxstats $dir/$spikein/bam/$sample.sorted.bam | grep chrM | cut -f 3)
+        otherreads=$(samtools idxstats $dir/$spikein/bam/$sample.sorted.bam \
+        | grep -v -w 'chrM\|chr1\|chr2\|chr3\|chr4\|chr5\|chr6\|chr7\|chr8\|chr9\|chr10\|chr11\|chr12\|chr13\|chr14\|chr15\|chr16\|chr17\|chr18\|chr19\|chr20\|chr21\|chr22\|chr23\|chrX\|chrY' \
+        | cut -f 3 \
+        | awk 'BEGIN{OFS="\t"}{ sum += $1 } END { if (NR > 0) print sum }')
+        unreads=$(samtools view -c -f 4 $dir/$spikein/bam/$sample.sorted.bam)
+        totreads=$(samtools view -c $dir/$spikein/bam/$sample.sorted.bam)
+
+        #remove mtDNA reads
+        samtools idxstats $dir/$spikein/bam/$sample.sorted.bam \
+        | cut -f 1 \
+        | grep -v 'chrM' \
+        | xargs samtools view -F 4 -b $dir/$spikein/bam/$sample.sorted.bam \
+        > $dir/$spikein/bam/$sample.noMT.bam
+
+        if [ ! -f $dir/$spikein/bam/$sample.noMT.bam ]; then
+            echo "error during $spikein bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ remove mtDNA and unmapped reads"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        samtools sort $dir/$spikein/bam/$sample.noMT.bam -o $dir/$spikein/bam/$sample.noMT.sorted.bam
+        samtools index $dir/$spikein/bam/$sample.noMT.sorted.bam $dir/$spikein/bam/$sample.noMT.bai
+        rm $dir/$spikein/bam/$sample.sorted.bam
+        rm $dir/$spikein/bam/$sample.sorted.bai
+        rm $dir/$spikein/bam/$sample.noMT.bam
+        rm $dir/$spikein/bam/$sample.noMT.bai
+
+        if [[ "$duplicates" == "allow" ]]; then
+          #REMOVE DUPLICATES; https://gatk.broadinstitute.org/hc/en-us/articles/360037052812-MarkDuplicates-Picard-
+          java -jar $PICARDJAR MarkDuplicates \
+            REMOVE_SEQUENCING_DUPLICATES=true \
+            I=$dir/$spikein/bam/$sample.noMT.sorted.bam \
+            O=$dir/$spikein/bam/$sample.NoDup.bam \
+            M=$dir/$spikein/bam/$sample\_dup_metrics.txt
+        else
+          java -jar $PICARDJAR MarkDuplicates \
+            REMOVE_DUPLICATES=true \
+            I=$dir/$spikein/bam/$sample.noMT.sorted.bam \
+            O=$dir/$spikein/bam/$sample.NoDup.bam \
+            M=$dir/$spikein/bam/$sample\_dup_metrics.txt
+        fi
+
+        if [ ! -f $dir/$spikein/bam/$sample.NoDup.bam ]; then
+            echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ remove duplicates"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        samtools sort $dir/$spikein/bam/$sample.NoDup.bam -o $dir/$spikein/bam/$sample.bam
+        samtools index $dir/$spikein/bam/$sample.bam $dir/$spikein/bam/$sample.bai
+
+        rm $dir/$spikein/bam/$sample.noMT.sorted.bam
+        rm $dir/$spikein/bam/$sample.NoDup.bam
+
+        dupreads=$(grep -w Unknown $dir/$spikein/bam/$sample\_dup_metrics.txt | cut -f 7)
+
+        readcount=$(samtools view -c $dir/$spikein/bam/$sample.bam)
+
+        if [ ! -f $dir/$spikein/bam/output_stats.txt ]; then
+          echo echo | awk 'BEGIN{OFS="\t"}{ print "sample","total_reads","mtDNA","partial_assemblies","unaligned","duplicate","final_reads" }' - \
+          > $dir/$spikein/bam/output_stats.txt
+        fi
+
+        #Check and remove previous readcounts.
+        if [ -f $dir/$spikein\_readcounts.txt ]; then
+            sed -i "/\b$sample\b/d" $dir/$spikein\_readcounts.txt
+        fi
+        if [ -f $dir/$spikein/bam/output_stats.txt ]; then
+            sed -i "/\b$sample\b/d" $dir/$spikein/bam/output_stats.txt
+        fi
+
+        echo echo | awk -v s="$sample" -v t="$totreads" -v m="$mtreads" -v o="$otherreads" -v u="$unreads" -v d="$dupreads" -v r="$readcount" \
+        'BEGIN{OFS="\t"}{ print s,t,m,o,u,d,r }' - \
+        >> $dir/$spikein/bam/output_stats.txt
+
+        echo echo | awk -v r="$readcount" -v g="$spikein" -v s="$sample" 'BEGIN{OFS="\t"}{ print s,r,g }' - \
+        >> $dir/$spikein\_readcounts.txt
+
+        if [ ! -f $dir/$spikein/bam/$sample.bam ]; then
+            echo "error during bam processing \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        module unload picard
+        module unload samtools
+      fi
+    fi
+  fi
+
+  #MACS2 peak calling
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]] || [[ "$step" == "callpeaks" ]]; then
+    if [[ "$input" == "input" ]]; then
+      echo "$sample is an Input 乁(  °ω°)ㄏ skipping peak calls"
+    elif [[ "$input" == "false" ]]; then
+      echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+      if [ ! -d $dir/$genome/MACS2_out ]; then
+          mkdir $dir/$genome/MACS2_out
+      fi
+      if [ ! -d $dir/$genome/MACS2_out/individual_reps ]; then
+          mkdir $dir/$genome/MACS2_out/individual_reps
+      fi
+
+      #CALL PEAKS; https://github.com/taoliu/MACS/blob/master/README.md
+      module load macs/2.1.2
+
+      if [[ "$peak" == "narrow" ]]; then
+
+        if [[ "$type" == "paired" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        elif [[ "$type" == "single" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.narrowPeak ]; then
+            echo "error during peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        module load bedtools
+        #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+        #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+        bedtools intersect -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.narrowPeak -b $blacklist -v \
+        | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+        | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed
+        module unload bedtools
+
+        macs2 refinepeak \
+        -b $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed \
+        -i $dir/$genome/bam/$sample.bam \
+        -o $dir/$genome/MACS2_out/individual_reps/$sample\_refined_summits.bed
+
+      elif [[ "$peak" == "broad" ]]; then
+
+        if [[ "$type" == "paired" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+          --max-gap 2000 --min-length 450 \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        elif [[ "$type" == "single" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+          --max-gap 2000 --min-length 450 \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.broadPeak ]; then
+            echo "error during peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        module load bedtools
+        #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+        #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+        bedtools intersect -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.broadPeak -b $blacklist -v \
+        | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+        | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed
+        module unload bedtools
+
+        macs2 refinepeak \
+        -b $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed \
+        -i $dir/$genome/bam/$sample.bam \
+        -o $dir/$genome/MACS2_out/individual_reps/$sample\_refined_summits.bed
+
+      fi
+      module unload macs/2.1.2
+
+      fragsize=$(grep "mean fragment size .* from treatment" serialJob.$SLURM_JOB_ID.time | cut -f 16 -d " ")
+      echo "mean fragment size is $fragsize (っ◕ _______ ◕)っ"
+
+    else
+      while [ ! -f $input ]
+      do
+        echo "$input is not finished aligning... taking a nap! ヾ(   ￣ o ￣ )ﾂ "
+        sleep 30m
+      done
+      echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+      if [ ! -d $dir/$genome/MACS2_out ]; then
+          mkdir $dir/$genome/MACS2_out
+      fi
+      if [ ! -d $dir/$genome/MACS2_out/individual_reps ]; then
+          mkdir $dir/$genome/MACS2_out/individual_reps
+      fi
+
+      #CALL PEAKS; https://github.com/taoliu/MACS/blob/master/README.md
+      module load macs/2.1.2
+
+      if [[ "$peak" == "narrow" ]]; then
+
+        if [[ "$type" == "paired" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          -c $input \
+          --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        elif [[ "$type" == "single" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          -c $input \
+          --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.narrowPeak ]; then
+            echo "error during peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        module load bedtools
+        #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+        #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+        bedtools intersect -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.narrowPeak -b $blacklist -v \
+        | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+        | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed
+        module unload bedtools
+
+        macs2 refinepeak \
+        -b $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed \
+        -i $dir/$genome/bam/$sample.bam \
+        -o $dir/$genome/MACS2_out/individual_reps/$sample\_refined_summits.bed
+
+      elif [[ "$peak" == "broad" ]]; then
+
+        if [[ "$type" == "paired" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          -c $input \
+          --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+          --max-gap 2000 --min-length 450 \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        elif [[ "$type" == "single" ]]; then
+
+          macs2 callpeak -t $dir/$genome/bam/$sample.bam \
+          -c $input \
+          --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+          --max-gap 2000 --min-length 450 \
+          -n $sample --outdir $dir/$genome/MACS2_out/individual_reps
+
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.broadPeak ]; then
+            echo "error during peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        module load bedtools
+        #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+        #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+        bedtools intersect -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks.broadPeak -b $blacklist -v \
+        | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+        | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed
+        module unload bedtools
+
+        macs2 refinepeak \
+        -b $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed \
+        -i $dir/$genome/bam/$sample.bam \
+        -o $dir/$genome/MACS2_out/individual_reps/$sample\_refined_summits.bed
+
+      fi
+      module unload macs/2.1.2
+
+      fragsize=$(grep "mean fragment size .* from treatment" serialJob.$SLURM_JOB_ID.time | cut -f 16 -d " ")
+      echo "mean fragment size is $fragsize (っ◕ _______ ◕)っ"
+
+    fi
+  fi
+
+  #Calculate FRiP score
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]] || [[ "$step" == "callpeaks" ]] || [[ "$step" == "frip" ]]; then
+    if [[ "$input" == "input" ]]; then
+      echo "$sample is an Input 乁(  °^°)ㄏ skipping FRiP score"
+    else
+      smerge=$(echo $sample | grep merged | wc -l | cut -f 1 -d " ")
+
+      if [[ "$smerge" -eq "1" ]]; then
+        if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.bed ]; then
+            echo "peak file $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.bed does not exist \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        awk 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print "Peak_"NR,$1,$2,$3,"."}' $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.bed \
+        > $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.saf
+
+        if [[ "$type" == "paired" ]]; then
+          module load subread/1.6.3
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample.bam
+          module unload subread/1.6.3
+        elif [[ "$type" == "single" ]]; then
+          module load subread/1.6.3
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample.bam
+          module unload subread/1.6.3
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR_featureCounts.txt ]; then
+            echo "featureCounts error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+        rcount=$(grep "Total alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 8 -d " ")
+
+        readsinpeaks=$(grep "Successfully assigned alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 9 -d " ")
+
+        frip=$(echo echo | awk -v r="$rcount" -v p="$readsinpeaks" '{ print p/r }')
+
+        if [[ "$frip" > 0.7 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (づ ￣ ³￣)づ $frip "
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR_featureCounts.txt
+        elif [[ "$frip" > 0 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (つ◕ ﹏◕)つ $frip "
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_peaks_FDR_featureCounts.txt
+        else
+          echo "error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+      else
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed ]; then
+            echo "peak file $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed does not exist \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        awk 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print "Peak_"NR,$1,$2,$3,"."}' $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.bed \
+        > $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.saf
+
+        if [[ "$type" == "paired" ]]; then
+          module load subread/1.6.3
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample.bam
+          module unload subread/1.6.3
+        elif [[ "$type" == "single" ]]; then
+          module load subread/1.6.3
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample.bam
+          module unload subread/1.6.3
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR_featureCounts.txt ]; then
+            echo "featureCounts error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+        rcount=$(grep "Total alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 8 -d " ")
+
+        readsinpeaks=$(grep "Successfully assigned alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 9 -d " ")
+
+        frip=$(echo echo | awk -v r="$rcount" -v p="$readsinpeaks" '{ print p/r }')
+
+        if [[ "$frip" > 0.7 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (づ ￣ ³￣)づ $frip "
+          rm $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR_featureCounts.txt
+        elif [[ "$frip" > 0 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (つ◕ ﹏◕)つ $frip "
+          rm $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/individual_reps/$sample\_peaks_FDR_featureCounts.txt
+        else
+          echo "error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+      fi
+    fi
+  fi
+
+  #Bigwig creation
+  if [[ "$step" == "srr" ]] || [[ "$step" == "trim" ]] || [[ "$step" == "align" ]] || [[ "$step" == "callpeaks" ]] || [[ "$step" == "bigwigs" ]]; then
+
+    echo "creating a large wig (๑˃̵ᴗ˂̵)و"
+    if [ ! -d $dir/$genome/bw ]; then
+        mkdir $dir/$genome/bw
+    fi
+
+    module load deeptools
+    bamCoverage --binSize 5 --smoothLength 50 --blackListFileName $blacklist --numberOfProcessors $cputhread --normalizeUsing CPM \
+    --bam $dir/$genome/bam/$sample.bam \
+    -o $dir/$genome/bw/$sample\_CPM.bw
+    module unload deeptools
+
+    if [ ! -f $dir/$genome/bw/$sample\_CPM.bw ]; then
+        echo "error during bigwig creation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+    fi
+  fi
+
+  #Spike-in downsampling
+  if [[ "$step" == "downsample" ]]; then
+
+    echo "downsampling to $spikein (✿  ・ω  ・)"
+
+    if [ ! -f $dir/$spikein\_readcounts.txt ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $spikein\_readcounts.txt file does not exist"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+        exit 1
+    fi
+
+    if [ ! -d $dir/$genome/$spikein\_normalized ]; then
+        mkdir $dir/$genome/$spikein\_normalized
+    fi
+
+    if [ ! -d $dir/$genome/$spikein\_normalized/bam ]; then
+        mkdir $dir/$genome/$spikein\_normalized/bam
+    fi
+
+    if [ ! -d $dir/$genome/$spikein\_normalized/bw ]; then
+        mkdir $dir/$genome/$spikein\_normalized/bw
+    fi
+
+    if [[ -z "$downsamplelistfile" ]]; then
+
+      downsamplelistname=temp
+
+      minreads=$(grep 'ecoli\|drosophila' $dir/$spikein\_readcounts.txt \
+      | grep -v 'INPUT\|Input\|input' \
+      | sort -k 2,2n \
+      | cut -f 2 \
+      | head -n 1)
+
+      if [[ "$minreads" -lt "1" ]]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ check $dir/$spikein\_readcounts.txt"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+        exit 1
+      fi
+
+      grep 'ecoli\|drosophila' $dir/$spikein\_readcounts.txt \
+      | grep -v 'INPUT\|Input\|input' \
+      | sort -k 2,2n \
+      | awk -v m="$minreads" '{ {print $1" "m/$2} }' \
+      > $dir/$spikein.temp.norm
+
+    else
+
+      echo "grouping samples in $downsamplelistfile for downsampling"
+
+      fn=$(basename "${downsamplelistfile}")
+      downsamplelistname=${fn%.*}
+
+      if [ ! -f $downsamplelistfile ]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $downsamplelistfile does not exist!"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+        exit 1
+      fi
+
+      if [ -f $dir/$downsamplelistname\_$spikein\_readcounts.txt ]; then
+        rm $dir/$downsamplelistname\_$spikein\_readcounts.txt
+      fi
+
+      while IFS=" " read -r sample
+      do
+        grep -w $sample $dir/$spikein\_readcounts.txt \
+        >> $dir/$downsamplelistname\_$spikein\_readcounts.txt
+      done < $downsamplelistfile
+
+      minreads=$(grep 'ecoli\|drosophila' $dir/$downsamplelistname\_$spikein\_readcounts.txt \
+      | grep -v 'INPUT\|Input\|input' \
+      | sort -k 2,2n \
+      | cut -f 2 \
+      | head -n 1)
+
+      if [[ "$minreads" -lt "1" ]]; then
+        echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ check $dir/$spikein\_readcounts.txt"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+        exit 1
+      fi
+
+      grep 'ecoli\|drosophila' $dir/$downsamplelistname\_$spikein\_readcounts.txt \
+      | grep -v 'INPUT\|Input\|input' \
+      | sort -k 2,2n \
+      | awk -v m="$minreads" '{ {print $1" "m/$2} }' \
+      > $dir/$spikein.$downsamplelistname.norm
+
+      rm $dir/$downsamplelistname\_$spikein\_readcounts.txt
+
+    fi
+
+
+    while IFS=" " read -r sample norm
+    do
+      echo "downsampling $sample! ( ∩ ◕ ヮ◕)づ ✧ .*･｡ﾟ☆ normalization factor: $norm"
+
+      /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/downsample.sh \
+      -a $dir/$genome/bam/$sample.bam \
+      -p $norm \
+      -o $dir/$genome/$spikein\_normalized/bam
+
+      if [ ! -f $dir/$genome/$spikein\_normalized/bam/$sample.downsampled.bam ]; then
+          echo "error during $sample downsampling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+          exit 1
+      fi
+
+      module load samtools
+      downreads=$(samtools view -c $dir/$genome/$spikein\_normalized/bam/$sample.downsampled.bam)
+
+      echo echo | awk -v s="$sample" -v r="$downreads" 'BEGIN{OFS="\t"}{ print s,r }' - \
+      >> $dir/$genome/$spikein\_normalized/bam/downsampled_stats.txt
+
+      samtools sort $dir/$genome/$spikein\_normalized/bam/$sample.downsampled.bam -o $dir/$genome/$spikein\_normalized/bam/$sample.$spikein\_downsampled.bam
+      samtools index $dir/$genome/$spikein\_normalized/bam/$sample.$spikein\_downsampled.bam $dir/$genome/$spikein\_normalized/bam/$sample.$spikein\_downsampled.bai
+      rm $dir/$genome/$spikein\_normalized/bam/$sample.downsampled.bam
+      rm $dir/$genome/$spikein\_normalized/bam/$sample.downsampled.bai
+
+      module unload samtools
+
+      module load deeptools
+      bamCoverage --binSize 5 --smoothLength 50 --blackListFileName $blacklist --numberOfProcessors $cputhread --normalizeUsing None \
+      --bam $dir/$genome/$spikein\_normalized/bam/$sample.$spikein\_downsampled.bam \
+      -o $dir/$genome/$spikein\_normalized/bw/$sample.$spikein\_downsampled.bw
+      module unload deeptools
+
+      if [ ! -f $dir/$genome/$spikein\_normalized/bw/$sample.$spikein\_downsampled.bw ]; then
+          echo "error during $sample bigwig creation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+          exit 1
+      fi
+
+    done < $dir/$spikein.$downsamplelistname.norm
+
+    rm $dir/$spikein.$downsamplelistname.norm
+  fi
+
+  #Sample merging
+  if [[ "$step" == "merge" ]]; then
+    if [[ "$mergelist" == "false" ]]; then
+      #Check and remove previous readcounts.
+      if [ -f $dir/$genome\_readcounts.txt ]; then
+          sed -i "/\b$sample\_merged\b/d" $dir/$genome\_readcounts.txt
+      fi
+      if [ -f $dir/$genome/bam/output_stats.txt ]; then
+          sed -i "/\b$sample\_merged\b/d" $dir/$genome/bam/output_stats.txt
+      fi
+      if [ -f $dir/$spikein\_readcounts.txt ]; then
+          sed -i "/\b$sample\_merged\b/d" $dir/$spikein\_readcounts.txt
+      fi
+      if [ -f $dir/$spikein/bam/output_stats.txt ]; then
+          sed -i "/\b$sample\_merged\b/d" $dir/$spikein/bam/output_stats.txt
+      fi
+
+      if [[ "$spikein" == "ecoli_spikein" ]] || [[ "$spikein" == "drosophila_spikein" ]]; then
+
+        echo "merging replicates for $sample (ﾉ*’ω’*)ﾉ彡┻━┻"
+
+        repnum=$(cat $dir/$genome\_readcounts.txt \
+        | grep $sample\_rep \
+        | wc -l | cut -f 1 -d " ")
+
+        module load picard/2.10.3
+        if [[ "$repnum" == "2" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "3" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "4" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "5" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "6" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep6.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "7" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep6.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep7.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "8" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep6.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep7.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep8.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "9" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep6.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep7.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep8.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep9.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "10" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep1.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep2.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep3.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep4.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep5.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep6.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep7.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep8.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep9.$spikein\_downsampled.bam \
+          I=$dir/$genome/$spikein\_normalized/bam/$sample\_rep10.$spikein\_downsampled.bam \
+          O=$dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+        elif [[ "$repnum" -lt "2" ]]; then
+          echo "less than two reps found (  ㆆ ______ ㆆ)"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+        elif [[ "$repnum" -gt "10" ]]; then
+          echo "too many reps! chill out! O=('-'Q) "
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+        fi
+        module unload picard
+
+        if [ ! -f $dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp ]; then
+            echo "error during downsampled bam merging \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        module load samtools
+        samtools sort $dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp -o $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam
+        samtools index $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bai
+        rm $dir/$genome/$spikein\_normalized/bam/$sample\_merged.temp
+
+        mergereads=$(samtools view -c $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam)
+
+        echo echo | awk -v s="$sample\_merged" -v r="$mergereads" 'BEGIN{OFS="\t"}{ print s,r }' - \
+        >> $dir/$genome/$spikein\_normalized/bam/downsampled_stats.txt
+
+        module unload samtools
+
+        if [ ! -d $dir/$genome/$spikein\_normalized/bw ]; then
+            mkdir $dir/$genome/$spikein\_normalized/bw
+        fi
+
+        module load deeptools
+        bamCoverage --binSize 5 --smoothLength 50 --blackListFileName $blacklist --numberOfProcessors $cputhread --normalizeUsing None \
+        --bam $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+        -o $dir/$genome/$spikein\_normalized/bw/$sample\_merged.bw
+        module unload deeptools
+
+        if [ ! -f $dir/$genome/$spikein\_normalized/bw/$sample\_merged.bw ]; then
+            echo "error during merged bigwig creation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        if [ ! -d $dir/$genome/$spikein\_normalized/MACS2_out ]; then
+            mkdir $dir/$genome/$spikein\_normalized/MACS2_out
+        fi
+
+        if [ ! -d $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps ]; then
+            mkdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+        fi
+
+        module load macs/2.1.2
+        if [[ "$peak" == "narrow" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          fi
+
+          if [ ! -f $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+        elif [[ "$peak" == "broad" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps
+            fi
+          fi
+
+
+          if [ ! -f $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+        fi
+        module unload macs/2.1.2
+
+        fragsize=$(grep "mean fragment size .* from treatment" serialJob.$SLURM_JOB_ID.time | cut -f 16 -d " ")
+        echo "mean fragment size is $fragsize (っ◕ _______ ◕)っ"
+
+        #Calculate FRiP score
+        awk 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print "Peak_"NR,$1,$2,$3,"."}' $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+        > $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+
+        if [[ "$type" == "paired" ]]; then
+          module load subread/1.6.3
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf \
+          -o $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt \
+          $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam
+          module unload subread/1.6.3
+        elif [[ "$type" == "single" ]]; then
+          module load subread/1.6.3
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf \
+          -o $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt \
+          $dir/$genome/$spikein\_normalized/bam/$sample\_merged.bam
+          module unload subread/1.6.3
+        fi
+
+        if [ ! -f $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt ]; then
+            echo "featureCounts error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+        rcount=$(grep "Total alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 8 -d " ")
+
+        readsinpeaks=$(grep "Successfully assigned alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 9 -d " ")
+
+        frip=$(echo echo | awk -v r="$rcount" -v p="$readsinpeaks" '{ print p/r }')
+
+        if [[ "$frip" > 0.7 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (づ ￣ ³￣)づ $frip "
+          rm $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+          rm $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt
+        elif [[ "$frip" > 0 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (つ◕ ﹏◕)つ $frip "
+          rm $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+          rm $dir/$genome/$spikein\_normalized/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt
+        else
+          echo "error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+      else
+        echo "merging replicates for $sample (ﾉ*’ω’*)ﾉ彡┻━┻"
+
+        if [ ! -f $dir/$genome\_readcounts.txt ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $genome\_readcounts.txt file does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+            exit 1
+        fi
+
+        if [ ! -d $dir/$genome/$sample\_tempbams ]; then
+            mkdir $dir/$genome/$sample\_tempbams
+        fi
+
+        repnum=$(cat $dir/$genome\_readcounts.txt \
+        | grep $sample\_rep \
+        | wc -l | cut -f 1 -d " ")
+
+        minreads=$(cat $dir/$genome\_readcounts.txt \
+        | grep $sample \
+        | sort -k 2,2n \
+        | cut -f 2 \
+        | head -n 1)
+
+        if [[ "$minreads" -lt "1" ]]; then
+          echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ check $dir/$genome\_readcounts.txt"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.err
+          exit 1
+        fi
+
+        cat $dir/$genome\_readcounts.txt \
+        | grep $sample \
+        | sort -k 2,2n \
+        | awk -v m="$minreads" '{ {print $1" "m/$2} }' \
+        > $dir/$genome/$sample\_tempbams/$sample.temp.norm
+
+        while IFS=" " read -r rep norm
+        do
+          /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/downsample.sh \
+          -a $dir/$genome/bam/$rep.bam \
+          -p $norm \
+          -o $dir/$genome/$sample\_tempbams
+
+          module load samtools
+          downreads=$(samtools view -c $dir/$genome/$sample\_tempbams/$rep.downsampled.bam)
+          module unload samtools
+
+          echo echo | awk -v s="$rep" -v r="$downreads" 'BEGIN{OFS="\t"}{ print s,r }' - \
+          >> $dir/$genome/bam/downsampled_stats.txt
+
+        done < $dir/$genome/$sample\_tempbams/$sample.temp.norm
+
+        rm $dir/$genome/$sample\_tempbams/$sample.temp.norm
+
+        module load picard/2.10.3
+        if [[ "$repnum" == "2" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "3" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "4" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "5" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "6" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep6.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "7" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep6.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep7.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "8" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep6.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep7.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep8.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "9" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep6.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep7.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep8.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep9.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "10" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep1.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep2.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep3.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep4.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep5.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep6.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep7.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep8.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep9.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$sample\_rep10.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" -lt "2" ]]; then
+          echo "less than two reps found (  ㆆ ______ ㆆ)"
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+        elif [[ "$repnum" -gt "10" ]]; then
+          echo "too many reps! chill out! O=('-'Q) "
+          mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+          mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+          exit 1
+        fi
+        module unload picard
+
+        if [ ! -f $dir/$genome/bam/$sample\_merged.temp ]; then
+            echo "error during downsampled bam merging \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        rm -r $dir/$genome/$sample\_tempbams
+
+        module load samtools
+        samtools sort $dir/$genome/bam/$sample\_merged.temp -o $dir/$genome/bam/$sample\_merged.bam
+        samtools index $dir/$genome/bam/$sample\_merged.bam $dir/$genome/bam/$sample\_merged.bai
+        rm $dir/$genome/bam/$sample\_merged.temp
+
+        mergereads=$(samtools view -c $dir/$genome/bam/$sample\_merged.bam)
+
+        echo echo | awk -v s="$sample\_merged" -v r="$mergereads" 'BEGIN{OFS="\t"}{ print s,r }' - \
+        >> $dir/$genome/bam/downsampled_stats.txt
+
+        module unload samtools
+
+        if [ ! -d $dir/$genome/bw ]; then
+            mkdir $dir/$genome/bw
+        fi
+
+        module load deeptools
+        bamCoverage --binSize 5 --smoothLength 50 --blackListFileName $blacklist --numberOfProcessors $cputhread --normalizeUsing CPM \
+        --bam $dir/$genome/bam/$sample\_merged.bam \
+        -o $dir/$genome/bw/$sample\_merged.bw
+        module unload deeptools
+
+        if [ ! -f $dir/$genome/bw/$sample\_merged.bw ]; then
+            echo "error during merged bigwig creation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        if [ ! -d $dir/$genome/MACS2_out ]; then
+            mkdir $dir/$genome/MACS2_out
+        fi
+
+        if [ ! -d $dir/$genome/MACS2_out/merged_reps ]; then
+            mkdir $dir/$genome/MACS2_out/merged_reps
+        fi
+
+        module load macs/2.1.2
+        if [[ "$peak" == "narrow" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          fi
+
+          if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+          macs2 refinepeak \
+          -b $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+          -i $dir/$genome/bam/$sample\_merged.bam \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_refined_summits.bed
+
+        elif [[ "$peak" == "broad" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          fi
+
+          if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+          macs2 refinepeak \
+          -b $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+          -i $dir/$genome/bam/$sample\_merged.bam \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_refined_summits.bed
+        fi
+        module unload macs/2.1.2
+
+        fragsize=$(grep "mean fragment size .* from treatment" serialJob.$SLURM_JOB_ID.time | cut -f 16 -d " ")
+        echo "mean fragment size is $fragsize (っ◕ _______ ◕)っ"
+
+        #Calculate FRiP score
+        awk 'BEGIN{OFS="\t"} {print "GeneID","Chr","Start","End","Strand"} { print "Peak_"NR,$1,$2,$3,"."}' $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+        > $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+
+        if [[ "$type" == "paired" ]]; then
+          module load subread/1.6.3
+          featureCounts -p -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample\_merged.bam
+          module unload subread/1.6.3
+        elif [[ "$type" == "single" ]]; then
+          module load subread/1.6.3
+          featureCounts -T $cputhread -F SAF \
+          -O --fraction -M \
+          -G $fasta -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt \
+          $dir/$genome/bam/$sample\_merged.bam
+          module unload subread/1.6.3
+        fi
+
+        if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt ]; then
+            echo "featureCounts error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+
+        rcount=$(grep "Total alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 8 -d " ")
+
+        readsinpeaks=$(grep "Successfully assigned alignments" serialJob.$SLURM_JOB_ID.time | head -n 1 | cut -f 9 -d " ")
+
+        frip=$(echo echo | awk -v r="$rcount" -v p="$readsinpeaks" '{ print p/r }')
+
+        if [[ "$frip" > 0.7 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (づ ￣ ³￣)づ $frip "
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt
+        elif [[ "$frip" > 0 ]]; then
+          echo "Fraction of Reads in Peaks (FRiP) (つ◕ ﹏◕)つ $frip "
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.saf
+          rm $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR_featureCounts.txt
+        else
+          echo "error during FRiP calculation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+        fi
+      fi
+    else
+      #merge replicates from $mergefile
+
+      repnum=$(cat $mergefile | wc -l | cut -f 1 -d " ")
+      fn=$(basename "${mergefile}")
+      sample=${fn%.*}
+
+      if [ ! -d $dir/$genome ]; then
+          mkdir $dir/$genome
+      fi
+      if [ ! -d $dir/$genome/bam ]; then
+          mkdir $dir/$genome/bam
+      fi
+      if [ ! -d $dir/$genome/$sample\_tempbams ]; then
+          mkdir $dir/$genome/$sample\_tempbams
+      fi
+
+      module load samtools
+      #process replicate information
+      if [[ "$repnum" -lt "2" ]]; then
+        echo "less than two reps found (  ㆆ ______ ㆆ)"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+      fi
+      if [[ "$repnum" -gt "10" ]]; then
+        echo "too many reps! chill out! O=('-'Q) "
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+      fi
+      if [[ "$repnum" -gt "1" ]]; then
+        #rep1
+        if [ ! -f $rep1 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep1 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep1=$(cat $mergefile | tail -n +1 | head -n 1)
+        rep1reads=$(samtools view -c $rep1)
+        rep1name=$(basename "${rep1}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep1name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep1" -v r="$rep1reads" -v n="$rep1name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+
+        #rep2
+        if [ ! -f $rep2 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep2 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep2=$(cat $mergefile | tail -n +2 | head -n 1)
+        rep2reads=$(samtools view -c $rep2)
+        rep2name=$(basename "${rep2}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep2name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep2" -v r="$rep2reads" -v n="$rep2name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "2" ]]; then
+        #rep3
+        if [ ! -f $rep3 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep3 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep3=$(cat $mergefile | tail -n +3 | head -n 1)
+        rep3reads=$(samtools view -c $rep3)
+        rep3name=$(basename "${rep3}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep3name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep3" -v r="$rep3reads" -v n="$rep3name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "3" ]]; then
+        #rep4
+        if [ ! -f $rep4 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep4 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep4=$(cat $mergefile | tail -n +4 | head -n 1)
+        rep4reads=$(samtools view -c $rep4)
+        rep4name=$(basename "${rep4}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep4name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep4" -v r="$rep4reads" -v n="$rep4name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "4" ]]; then
+        #rep5
+        if [ ! -f $rep5 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep5 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep5=$(cat $mergefile | tail -n +5 | head -n 1)
+        rep5reads=$(samtools view -c $rep5)
+        rep5name=$(basename "${rep5}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep5name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep5" -v r="$rep5reads" -v n="$rep5name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "5" ]]; then
+        #rep6
+        if [ ! -f $rep6 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep6 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep6=$(cat $mergefile | tail -n +6 | head -n 1)
+        rep6reads=$(samtools view -c $rep6)
+        rep6name=$(basename "${rep6}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep6name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep6" -v r="$rep6reads" -v n="$rep6name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "6" ]]; then
+        #rep7
+        if [ ! -f $rep7 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep7 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep7=$(cat $mergefile | tail -n +7 | head -n 1)
+        rep7reads=$(samtools view -c $rep7)
+        rep7name=$(basename "${rep7}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep7name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep7" -v r="$rep7reads" -v n="$rep7name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "7" ]]; then
+        #rep8
+        if [ ! -f $rep8 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep8 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep8=$(cat $mergefile | tail -n +8 | head -n 1)
+        rep8reads=$(samtools view -c $rep8)
+        rep8name=$(basename "${rep8}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep8name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep8" -v r="$rep8reads" -v n="$rep8name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "8" ]]; then
+        #rep9
+        if [ ! -f $rep9 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep9 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep9=$(cat $mergefile | tail -n +9 | head -n 1)
+        rep9reads=$(samtools view -c $rep9)
+        rep9name=$(basename "${rep9}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep9name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep9" -v r="$rep9reads" -v n="$rep9name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      if [[ "$repnum" -gt "9" ]]; then
+        #rep10
+        if [ ! -f $rep10 ]; then
+            echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $rep10 does not exist"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+        rep10=$(cat $mergefile | tail -n +10 | head -n 1)
+        rep10reads=$(samtools view -c $rep10)
+        rep10name=$(basename "${rep10}" .bam)
+        if [ -f $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt ]; then
+            sed -i "/\b$rep10name\b/d" $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+        fi
+        echo echo | awk -v a="$rep10" -v r="$rep10reads" -v n="$rep10name" '{ {print a,r,n} }' >> $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+      fi
+      module unload samtools
+
+      if [[ -z $spikein ]]; then
+        echo "merging replicates for $sample (ﾉ*’ω’*)ﾉ彡┻━┻"
+
+        minreads=$(cat $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt \
+        | sort -k 2,2n \
+        | cut -f 2 -d " " \
+        | head -n 1)
+
+        cat $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt \
+        | sort -k 2,2n \
+        | awk -v m="$minreads" '{ {print $1" "m/$2" "$3} }' \
+        > $dir/$genome/$sample\_tempbams/$sample.temp.norm
+
+        while IFS=" " read -r rep norm name
+        do
+          /project/GCRB/Banaszynski_lab/shared/scripts/ryan_scripts/other/downsample.sh \
+          -a $rep \
+          -p $norm \
+          -o $dir/$genome/$sample\_tempbams
+        done < $dir/$genome/$sample\_tempbams/$sample.temp.norm
+
+        module load picard/2.10.3
+        if [[ "$repnum" == "2" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "3" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "4" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "5" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "6" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep6name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "7" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep6name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep7name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "8" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep6name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep7name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep8name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "9" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep6name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep7name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep8name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep9name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        elif [[ "$repnum" == "10" ]]; then
+          java -jar $PICARD/picard.jar MergeSamFiles \
+          I=$dir/$genome/$sample\_tempbams/$rep1name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep2name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep3name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep4name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep5name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep6name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep7name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep8name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep9name.downsampled.bam \
+          I=$dir/$genome/$sample\_tempbams/$rep10name.downsampled.bam \
+          O=$dir/$genome/bam/$sample\_merged.temp
+        fi
+        module unload picard
+
+        if [ ! -f $dir/$genome/bam/$sample\_merged.temp ]; then
+            echo "error during downsampled bam merging \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        rm -r $dir/$genome/$sample\_tempbams
+        rm $dir/$genome/$sample\_tempbams/$sample\_merging_readcounts.txt
+
+        module load samtools
+        samtools sort $dir/$genome/bam/$sample\_merged.temp -o $dir/$genome/bam/$sample\_merged.bam
+        samtools index $dir/$genome/bam/$sample\_merged.bam $dir/$genome/bam/$sample\_merged.bai
+        rm $dir/$genome/bam/$sample\_merged.temp
+
+        mergereads=$(samtools view -c $dir/$genome/bam/$sample\_merged.bam)
+
+        echo echo | awk -v s="$sample\_merged" -v r="$mergereads" 'BEGIN{OFS="\t"}{ print s,r }' - \
+        >> $dir/$genome/bam/downsampled_stats.txt
+
+        module unload samtools
+
+        if [ ! -d $dir/$genome/bw ]; then
+            mkdir $dir/$genome/bw
+        fi
+
+        module load deeptools
+        bamCoverage --binSize 5 --smoothLength 50 --blackListFileName $blacklist --numberOfProcessors $cputhread --normalizeUsing CPM \
+        --bam $dir/$genome/bam/$sample\_merged.bam \
+        -o $dir/$genome/bw/$sample\_merged.bw
+        module unload deeptools
+
+        if [ ! -f $dir/$genome/bw/$sample\_merged.bw ]; then
+            echo "error during merged bigwig creation \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+            mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+            mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+            exit 1
+        fi
+
+        if [ ! -d $dir/$genome/MACS2_out ]; then
+            mkdir $dir/$genome/MACS2_out
+        fi
+
+        if [ ! -d $dir/$genome/MACS2_out/merged_reps ]; then
+            mkdir $dir/$genome/MACS2_out/merged_reps
+        fi
+
+        module load macs/2.1.2
+        if [[ "$peak" == "narrow" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel -f BAMPE -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --call-summits --nomodel --extsize 146 -g $genome_size \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          fi
+
+          if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.narrowPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+          macs2 refinepeak \
+          -b $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+          -i $dir/$genome/bam/$sample\_merged.bam \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_refined_summits.bed
+
+        elif [[ "$peak" == "broad" ]]; then
+          if [[ "$input" == "false" ]]; then
+            echo "no input set, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          else
+            if [ ! -f $input ]; then
+                echo "error \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/ $input does not exist!"
+                mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+                mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+                exit 1
+            fi
+            echo "input set to $input, climbing peaks /|\ ^._.^ /|\ ~ flap flap ~"
+            if [[ "$type" == "paired" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel -f BAMPE -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            elif [[ "$type" == "single" ]]; then
+              macs2 callpeak -t $dir/$genome/bam/$sample\_merged.bam \
+              -c $input \
+              --keep-dup all --broad --nomodel --extsize 146 -g $genome_size \
+              --max-gap 2000 --min-length 450 \
+              -n $sample\_merged --outdir $dir/$genome/MACS2_out/merged_reps
+            fi
+          fi
+
+          if [ ! -f $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak ]; then
+              echo "error during merged peak calling \(∘⁼̴⃙̀˘ ⌂ ˘⁼̴⃙́∘ )/"
+              mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+              mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+              exit 1
+          fi
+
+          module load bedtools
+          #CREATE A PEAK BEDFILE, AND FILTERED FOR BLACKLISTED REGIONS; https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html
+          #FORMAT: <chr> <peak start> <peak end> <-log10(false discovery rate)>
+          bedtools intersect -a $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks.broadPeak -b $blacklist -v \
+          | awk 'BEGIN{OFS="\t"}{ if ($9 > 1) {print $1,$2,$3,$4=sprintf("%.1f",$9)} }' \
+          | bedtools merge -i - -c 4 -o max > $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed
+          module unload bedtools
+
+          macs2 refinepeak \
+          -b $dir/$genome/MACS2_out/merged_reps/$sample\_merged_peaks_FDR.bed \
+          -i $dir/$genome/bam/$sample\_merged.bam \
+          -o $dir/$genome/MACS2_out/merged_reps/$sample\_merged_refined_summits.bed
+
+        fi
+        module unload macs/2.1.2
+
+      else
+        echo "there is no automatic merging of spike-in normalized samples from separate experiments (つ ᗒ﹏ᗕ )つ "
+        echo "use the script to merge the non-normalized bams then manually downsample those to spike-in"
+        mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+        mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+        exit 1
+      fi
+    fi
+  fi
+
+  if [[ "$step" == "tobias" ]]; then
+
+    if [ ! -d $dir/$genome/tobias ]; then
+        mkdir $dir/$genome/tobias
+    fi
+
+    if [ -d $dir/$genome/MACS2_out/merged_reps ]; then
+
+      echo "beginning tobias analysis of merged reps"
+
+      module load bedtools
+
+      if [ ! -f $dir/$genome/MACS2_out/merged_reps/all_samples_merged_peaks_FDR.bed ]; then
+        cat $dir/$genome/MACS2_out/merged_reps/*_merged_peaks_FDR.bed \
+        | sort -k1,1 -k2,2n \
+        | bedtools merge -i - -c 4 -o max \
+        > $dir/$genome/MACS2_out/merged_reps/all_samples_merged_peaks_FDR.bed
+      fi
+
+      sleep 3m
+
+      module load tobias
+      #TRANSCRIPTION FACTOR FOOTPRINTING ANALYSIS; https://github.com/loosolab/TOBIAS/wiki
+      TOBIAS ATACorrect --bam $dir/$genome/bam/$sample\_merged.bam \
+      --genome $fasta \
+      --peaks $dir/$genome/MACS2_out/merged_reps/all_samples_merged_peaks_FDR.bed \
+      --cores $cputhread --prefix $sample\_merged --outdir $dir/$genome/tobias \
+      --blacklist $blacklist
+      TOBIAS ScoreBigwig --signal $dir/$genome/tobias/$sample\_merged_corrected.bw \
+      --regions $dir/$genome/MACS2_out/merged_reps/all_samples_merged_peaks_FDR.bed \
+      --output $dir/$genome/tobias/$sample\_merged_scored.bw \
+      --cores $cputhread
+      module unload bedtools
+      module unload tobias
+      rm $dir/$genome/tobias/$sample\_merged_bias.bw
+      rm $dir/$genome/tobias/$sample\_merged_expected.bw
+      rm $dir/$genome/tobias/$sample\_merged_uncorrected.bw
+
+    else
+
+      echo "beginning tobias analysis of individual reps"
+
+      module load bedtools
+
+      if [ ! -f $dir/$genome/MACS2_out/individual_reps/all_samples_merged_peaks_FDR.bed ]; then
+        cat $dir/$genome/MACS2_out/individual_reps/*_merged_peaks_FDR.bed \
+        | sort -k1,1 -k2,2n \
+        | bedtools merge -i - -c 4 -o max \
+        > $dir/$genome/MACS2_out/individual_reps/all_samples_merged_peaks_FDR.bed
+      fi
+
+      sleep 3m
+
+      module load tobias
+      #TRANSCRIPTION FACTOR FOOTPRINTING ANALYSIS; https://github.com/loosolab/TOBIAS/wiki
+      TOBIAS ATACorrect --bam $dir/$genome/bam/$sample.bam \
+      --genome $fasta \
+      --peaks $dir/$genome/MACS2_out/individual_reps/all_samples_merged_peaks_FDR.bed \
+      --cores $cputhread --prefix $sample --outdir $dir/$genome/tobias \
+      --blacklist $blacklist
+      TOBIAS ScoreBigwig --signal $dir/$genome/tobias/$sample\_corrected.bw \
+      --regions $dir/$genome/MACS2_out/individual_reps/all_samples_merged_peaks_FDR.bed \
+      --output $dir/$genome/tobias/$sample\_scored.bw \
+      --cores $cputhread
+      module unload bedtools
+      module unload tobias
+      rm $dir/$genome/tobias/$sample\_bias.bw
+      rm $dir/$genome/tobias/$sample\_expected.bw
+      rm $dir/$genome/tobias/$sample\_uncorrected.bw
+    fi
+  fi
+
+  mv serialJob.$SLURM_JOB_ID.out $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.out
+  mv serialJob.$SLURM_JOB_ID.time $dir/out_files/serialJob.$SLURM_JOB_ID.masterpipe.$step.$sample.err
+
+}
+
+main "$@"
